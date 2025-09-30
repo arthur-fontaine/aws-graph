@@ -119,6 +119,7 @@ function buildHtmlPage({
       (function () {
         const graphData = ${scriptGraph};
         const serviceColors = ${scriptColors};
+        const awsRegion = ${serializeForScript(resolveRegion())};
 
         function normalizeColor(color) {
           if (!color) return '#999999';
@@ -138,6 +139,77 @@ function buildHtmlPage({
           const b = parseInt(expanded.slice(4, 6), 16) / 255;
           const luminance = 0.2126 * r + 0.7152 * g + 0.0722 * b;
           return luminance > 0.65 ? '#000000' : '#ffffff';
+        }
+
+        function parseArn(value) {
+          if (typeof value !== 'string' || !value.startsWith('arn:')) {
+            return null;
+          }
+          const parts = value.split(':');
+          if (parts.length < 6) {
+            return null;
+          }
+          const [prefix, partition, service, region, accountId, ...resourceParts] = parts;
+          return {
+            prefix,
+            partition,
+            service,
+            region,
+            accountId,
+            resource: resourceParts.join(':'),
+            raw: value
+          };
+        }
+
+        function buildConsoleUrl(node) {
+          if (!node) {
+            return null;
+          }
+          const nodeId = node.id;
+          if (typeof nodeId !== 'string' || !nodeId) {
+            return null;
+          }
+
+          if (nodeId.startsWith('subnet:')) {
+            const subnetId = nodeId.slice('subnet:'.length);
+            return \`https://console.aws.amazon.com/vpc/home?region=\${awsRegion}#SubnetDetails:subnetId=\${encodeURIComponent(subnetId)}\`;
+          }
+
+          if (nodeId.startsWith('sg:')) {
+            const groupId = nodeId.slice('sg:'.length);
+            return \`https://console.aws.amazon.com/vpc/home?region=\${awsRegion}#SecurityGroup:groupId=\${encodeURIComponent(groupId)}\`;
+          }
+
+          const parsed = parseArn(nodeId);
+          if (!parsed) {
+            if ((node.service || '').toLowerCase() === 'lambda') {
+              return \`https://console.aws.amazon.com/lambda/home?region=\${awsRegion}#/functions/\${encodeURIComponent(nodeId)}?tab=monitoring\`;
+            }
+            return null;
+          }
+
+          const service = (parsed.service || '').toLowerCase();
+          const resource = parsed.resource || '';
+
+          if (service === 'lambda' && resource.startsWith('function:')) {
+            const functionName = resource.slice('function:'.length);
+            return \`https://console.aws.amazon.com/lambda/home?region=\${awsRegion}#/functions/\${encodeURIComponent(functionName)}?tab=monitoring\`;
+          }
+
+          if (service === 'sqs') {
+            const resourceSegments = resource.split('/');
+            const queueName = resourceSegments[resourceSegments.length - 1];
+            if (queueName) {
+              const queueUrl = \`https://sqs.\${awsRegion}.amazonaws.com/\${parsed.accountId || ''}/\${queueName}\`;
+              return \`https://console.aws.amazon.com/sqs/v2/home?region=\${awsRegion}#/queues/\${encodeURIComponent(queueUrl)}\`;
+            }
+          }
+
+          if (service === 'sns' && resource.startsWith('topic/')) {
+            return \`https://console.aws.amazon.com/sns/v3/home?region=\${awsRegion}#/topic/\${encodeURIComponent(parsed.raw)}\`;
+          }
+
+          return \`https://console.aws.amazon.com/resource-explorer/home?region=\${awsRegion}#Resources:ARN=\${encodeURIComponent(parsed.raw)}\`;
         }
 
         function buildEdgeKey(edge) {
@@ -531,6 +603,21 @@ function buildHtmlPage({
           function GraphApp() {
             const reactFlowInstanceRef = useRef(null);
             const focusedNodeRef = useRef(null);
+
+            const openDashboard = useCallback((node) => {
+              if (!node) {
+                return;
+              }
+              const descriptor = {
+                id: node.id,
+                service: node.data?.service || node.service || 'Unknown'
+              };
+              const url = buildConsoleUrl(descriptor);
+              if (!url) {
+                return;
+              }
+              window.open(url, '_blank', 'noopener');
+            }, []);
 
             const allServices = useMemo(() => {
               const serviceSet = new Set();
@@ -1001,6 +1088,9 @@ function buildHtmlPage({
                   },
                   onPaneClick: () => {
                     clearFocus();
+                  },
+                  onNodeDoubleClick: (event, node) => {
+                    openDashboard(node);
                   }
                 },
                 createElement(Background, { gap: 24, color: '#e2e2e2' }),
