@@ -285,7 +285,7 @@ function addLayerRelations(builder, functionNodeId, layers = []) {
       return;
     }
     const node = describeArn(layer.Arn);
-    builder.addNode({ ...node, service: 'Lambda' });
+    builder.addNode({ ...node, service: 'Layer' });
     builder.addEdge({ source: functionNodeId, target: node.id, type: 'layer' });
   });
 }

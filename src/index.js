@@ -271,8 +271,9 @@ function buildHtmlPage({
 
             const initialVisibility = useMemo(() => {
               const defaults = {};
+              const disabledByDefault = new Set(['IAM', 'Layer']);
               allServices.forEach((service) => {
-                defaults[service] = service === 'IAM' ? false : true;
+                defaults[service] = disabledByDefault.has(service) ? false : true;
               });
               return defaults;
             }, [allServices]);

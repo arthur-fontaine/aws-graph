@@ -14,6 +14,7 @@ export const serviceColors = {
   EC2: '#2E73B8',
   VPC: '#A9A7A1',
   IAM: '#634E86',
+  Layer: '#FF8C42',
   RDS: '#527FFF',
   SecretsManager: '#2E7D32',
   SSM: '#1B9984',
