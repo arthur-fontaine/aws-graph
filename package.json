@@ -1,0 +1,24 @@
+{
+  "name": "aws-graph",
+  "version": "1.0.0",
+  "description": "Inspect AWS Lambda-centric relationships and render an interactive graph.",
+  "type": "module",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "NODE_ENV=development node src/index.js"
+  },
+  "keywords": [
+    "aws",
+    "lambda",
+    "graph",
+    "mermaid"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "@aws-sdk/client-lambda": "^3.899.0",
+    "@aws-sdk/client-sts": "^3.899.0",
+    "@aws-sdk/credential-providers": "^3.899.0"
+  }
+}
