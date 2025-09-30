@@ -113,8 +113,8 @@ function buildHtmlPage({
     <footer>Service colors are hardcoded in the application and applied client-side.</footer>
     <script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
     <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
-    <script src="https://cdn.jsdelivr.net/npm/d3@7/dist/d3.min.js"></script>
     <script src="https://unpkg.com/reactflow@11.10.0/dist/umd/index.js" crossorigin></script>
+    <script src="https://cdn.jsdelivr.net/npm/dagre@0.8.5/dist/dagre.min.js" crossorigin></script>
     <script>
       (function () {
         const graphData = ${scriptGraph};
@@ -140,51 +140,306 @@ function buildHtmlPage({
           return luminance > 0.65 ? '#000000' : '#ffffff';
         }
 
-        function computeLayout(graph) {
-          const width = window.innerWidth || 1280;
-          const height = window.innerHeight || 720;
-          const simulationNodes = graph.nodes.map((node) => ({
-            id: node.id,
-            label: node.label ?? node.id,
-            service: node.service ?? 'Unknown',
-            x: Math.random() * width,
-            y: Math.random() * height
-          }));
-          const simulationLinks = graph.edges.map((edge) => ({
-            source: edge.source,
-            target: edge.target
-          }));
+        function buildHeuristicLayout(nodes, edges) {
+          // Fallback layered heuristic when dagre is unavailable.
+          const nodesById = new Map();
+          nodes.forEach((node) => {
+            nodesById.set(node.id, node);
+          });
 
-          if (simulationNodes.length === 0) {
+          const adjacency = new Map();
+          const incoming = new Map();
+          const indegree = new Map();
+
+          nodes.forEach((node) => {
+            adjacency.set(node.id, []);
+            incoming.set(node.id, []);
+            indegree.set(node.id, 0);
+          });
+
+          edges.forEach((edge) => {
+            if (!edge || !nodesById.has(edge.source) || !nodesById.has(edge.target)) {
+              return;
+            }
+            adjacency.get(edge.source).push(edge.target);
+            incoming.get(edge.target).push(edge.source);
+            indegree.set(edge.target, (indegree.get(edge.target) || 0) + 1);
+          });
+
+          const queue = [];
+          indegree.forEach((value, nodeId) => {
+            if (value === 0) {
+              queue.push(nodeId);
+            }
+          });
+
+          const layerById = new Map();
+          queue.forEach((nodeId) => layerById.set(nodeId, 0));
+          const visited = new Set();
+
+          while (queue.length > 0) {
+            const nodeId = queue.shift();
+            visited.add(nodeId);
+            const currentLayer = layerById.get(nodeId) ?? 0;
+            const neighbors = adjacency.get(nodeId) || [];
+            neighbors.forEach((targetId) => {
+              const proposedLayer = currentLayer + 1;
+              const existingLayer = layerById.get(targetId);
+              if (existingLayer == null || proposedLayer > existingLayer) {
+                layerById.set(targetId, proposedLayer);
+              }
+              const nextIndegree = (indegree.get(targetId) || 0) - 1;
+              indegree.set(targetId, nextIndegree);
+              if (nextIndegree === 0 && !visited.has(targetId)) {
+                queue.push(targetId);
+              }
+            });
+          }
+
+          const unresolved = [];
+          nodesById.forEach((_, nodeId) => {
+            if (!layerById.has(nodeId)) {
+              unresolved.push(nodeId);
+            }
+          });
+
+          function compareNodes(nodeIdA, nodeIdB) {
+            const nodeA = nodesById.get(nodeIdA);
+            const nodeB = nodesById.get(nodeIdB);
+            const serviceCompare = String(nodeA?.service || '').localeCompare(String(nodeB?.service || ''));
+            if (serviceCompare !== 0) {
+              return serviceCompare;
+            }
+            const labelCompare = String(nodeA?.label || '').localeCompare(String(nodeB?.label || ''));
+            if (labelCompare !== 0) {
+              return labelCompare;
+            }
+            return String(nodeIdA || '').localeCompare(String(nodeIdB || ''));
+          }
+
+          if (unresolved.length) {
+            let progress = true;
+            while (unresolved.length && progress) {
+              progress = false;
+              for (let index = unresolved.length - 1; index >= 0; index -= 1) {
+                const nodeId = unresolved[index];
+                const parentLayers = (incoming.get(nodeId) || [])
+                  .map((parentId) => layerById.get(parentId))
+                  .filter((layer) => layer != null);
+                if (!parentLayers.length) {
+                  continue;
+                }
+                layerById.set(nodeId, Math.max(...parentLayers) + 1);
+                unresolved.splice(index, 1);
+                progress = true;
+              }
+            }
+
+            if (unresolved.length) {
+              const usedLayers = Array.from(layerById.values());
+              const startLayer = usedLayers.length ? Math.max(...usedLayers) + 1 : 0;
+              unresolved.sort(compareNodes);
+              unresolved.forEach((nodeId, index) => {
+                layerById.set(nodeId, startLayer + index);
+              });
+            }
+          }
+
+          const layersByValue = new Map();
+          layerById.forEach((layer, nodeId) => {
+            const normalizedLayer = Number.isFinite(layer) ? layer : 0;
+            if (!layersByValue.has(normalizedLayer)) {
+              layersByValue.set(normalizedLayer, []);
+            }
+            layersByValue.get(normalizedLayer).push(nodeId);
+          });
+
+          const sortedLayerValues = Array.from(layersByValue.keys()).sort((a, b) => a - b);
+          const orderedLayers = [];
+          const orderWithinLayer = new Map();
+
+          function averageOrder(nodeIds) {
+            const values = nodeIds
+              .map((id) => orderWithinLayer.get(id))
+              .filter((value) => Number.isFinite(value));
+            if (!values.length) {
+              return null;
+            }
+            const total = values.reduce((sum, value) => sum + value, 0);
+            return total / values.length;
+          }
+
+          sortedLayerValues.forEach((layerValue, layerPosition) => {
+            const nodeIds = (layersByValue.get(layerValue) || []).slice().sort(compareNodes);
+            nodeIds.sort((nodeIdA, nodeIdB) => {
+              const parentAverageA = averageOrder(incoming.get(nodeIdA) || []);
+              const parentAverageB = averageOrder(incoming.get(nodeIdB) || []);
+
+              const hasParentsA = parentAverageA != null;
+              const hasParentsB = parentAverageB != null;
+
+              if (hasParentsA && hasParentsB && Math.abs(parentAverageA - parentAverageB) > 0.001) {
+                return parentAverageA - parentAverageB;
+              }
+              if (hasParentsA && !hasParentsB) {
+                return -1;
+              }
+              if (!hasParentsA && hasParentsB) {
+                return 1;
+              }
+              return compareNodes(nodeIdA, nodeIdB);
+            });
+
+            nodeIds.forEach((nodeId, index) => {
+              orderWithinLayer.set(nodeId, index);
+            });
+
+            orderedLayers[layerPosition] = { value: layerValue, nodes: nodeIds };
+          });
+
+          for (let layerIndex = orderedLayers.length - 2; layerIndex >= 0; layerIndex -= 1) {
+            const layerInfo = orderedLayers[layerIndex];
+            if (!layerInfo) {
+              continue;
+            }
+            const nodeIds = layerInfo.nodes.slice();
+            nodeIds.sort((nodeIdA, nodeIdB) => {
+              const childrenA = adjacency.get(nodeIdA) || [];
+              const childrenB = adjacency.get(nodeIdB) || [];
+              const childAverageA = averageOrder(childrenA);
+              const childAverageB = averageOrder(childrenB);
+              const hasChildrenA = childAverageA != null;
+              const hasChildrenB = childAverageB != null;
+
+              if (hasChildrenA && hasChildrenB && Math.abs(childAverageA - childAverageB) > 0.001) {
+                return childAverageA - childAverageB;
+              }
+              if (hasChildrenA && !hasChildrenB) {
+                return -1;
+              }
+              if (!hasChildrenA && hasChildrenB) {
+                return 1;
+              }
+              return compareNodes(nodeIdA, nodeIdB);
+            });
+            nodeIds.forEach((nodeId, index) => {
+              orderWithinLayer.set(nodeId, index);
+            });
+            orderedLayers[layerIndex].nodes = nodeIds;
+          }
+
+          const columnGap = 320;
+          const rowGap = 160;
+          const baseX = 80;
+          const baseY = 120;
+
+          const laidOutNodes = [];
+          const positionById = new Map();
+          orderedLayers.forEach((layerInfo, columnPosition) => {
+            if (!layerInfo) {
+              return;
+            }
+            const nodeIds = layerInfo.nodes;
+            let priorY = baseY - rowGap;
+            nodeIds.forEach((nodeId, index) => {
+              const node = nodesById.get(nodeId);
+              const parents = incoming.get(nodeId) || [];
+              const parentPositions = parents
+                .map((parentId) => positionById.get(parentId))
+                .filter((value) => Number.isFinite(value));
+              const idealY = parentPositions.length
+                ? parentPositions.reduce((sum, value) => sum + value, 0) / parentPositions.length
+                : baseY + index * rowGap;
+
+              const minimumY = priorY + rowGap * 0.8;
+              const snappedY = baseY + index * rowGap;
+              const finalY = Math.max(idealY, Math.max(snappedY, minimumY));
+              priorY = finalY;
+
+              laidOutNodes.push({
+                id: nodeId,
+                label: node?.label ?? nodeId,
+                service: node?.service ?? 'Unknown',
+                position: {
+                  x: baseX + columnPosition * columnGap,
+                  y: finalY
+                }
+              });
+              positionById.set(nodeId, finalY);
+            });
+          });
+
+          return { nodes: laidOutNodes, edges };
+        }
+
+        function computeLayout(graph) {
+          const nodes = Array.isArray(graph?.nodes)
+            ? graph.nodes.map((node) => ({
+                id: node.id,
+                label: node.label ?? node.id,
+                service: node.service ?? 'Unknown'
+              }))
+            : [];
+          const edges = Array.isArray(graph?.edges) ? graph.edges : [];
+
+          if (!nodes.length) {
             return { nodes: [], edges: [] };
           }
 
-          const forceSim = window.d3.forceSimulation(simulationNodes)
-            .force('link', window.d3.forceLink(simulationLinks).id((d) => d.id).distance(200).strength(0.2))
-            .force('charge', window.d3.forceManyBody().strength(-600))
-            .force('center', window.d3.forceCenter(width / 2, height / 2))
-            .force('collision', window.d3.forceCollide().radius(90))
-            .stop();
+          const dagreGraph = window.dagre?.graphlib?.Graph ? new window.dagre.graphlib.Graph() : null;
 
-          for (let i = 0; i < 300; i += 1) {
-            forceSim.tick();
+          if (dagreGraph) {
+            try {
+              dagreGraph.setGraph({
+                rankdir: 'LR',
+                nodesep: 160,
+                ranksep: 280,
+                edgesep: 120,
+                marginx: 120,
+                marginy: 80
+              });
+              dagreGraph.setDefaultEdgeLabel(() => ({}));
+
+              const NODE_WIDTH = 200;
+              const NODE_HEIGHT = 72;
+
+              nodes.forEach((node) => {
+                dagreGraph.setNode(node.id, { width: NODE_WIDTH, height: NODE_HEIGHT });
+              });
+
+              edges.forEach((edge) => {
+                if (!edge || !edge.source || !edge.target) {
+                  return;
+                }
+                dagreGraph.setEdge(edge.source, edge.target);
+              });
+
+              window.dagre.layout(dagreGraph);
+
+              const laidOutNodes = nodes.map((node) => {
+                const layoutNode = dagreGraph.node(node.id);
+                if (!layoutNode) {
+                  return {
+                    ...node,
+                    position: { x: 0, y: 0 }
+                  };
+                }
+                return {
+                  ...node,
+                  position: {
+                    x: layoutNode.x - NODE_WIDTH / 2,
+                    y: layoutNode.y - NODE_HEIGHT / 2
+                  }
+                };
+              });
+
+              return { nodes: laidOutNodes, edges };
+            } catch (layoutError) {
+              console.warn('dagre layout failed, falling back to heuristic layout', layoutError);
+            }
           }
 
-          const minX = Math.min(...simulationNodes.map((node) => node.x));
-          const minY = Math.min(...simulationNodes.map((node) => node.y));
-          const padding = 120;
-
-          const laidOutNodes = simulationNodes.map((node) => ({
-            id: node.id,
-            label: node.label,
-            service: node.service,
-            position: {
-              x: node.x - minX + padding,
-              y: node.y - minY + padding
-            }
-          }));
-
-          return { nodes: laidOutNodes, edges: graph.edges };
+          return buildHeuristicLayout(nodes, edges);
         }
 
         function buildReactFlowGraph(graph) {
@@ -197,6 +452,8 @@ function buildHtmlPage({
               id: node.id,
               data: { label: node.label, service: node.service },
               position: node.position,
+              sourcePosition: 'right',
+              targetPosition: 'left',
               style: {
                 background: color,
                 color: textColor,
@@ -239,7 +496,7 @@ function buildHtmlPage({
             return;
           }
 
-          if (!window.React || !window.ReactDOM || !window.ReactFlow || !window.d3) {
+          if (!window.React || !window.ReactDOM || !window.ReactFlow) {
             rootElement.innerHTML = '<p style="padding:1rem;">Failed to load required visualization libraries.</p>';
             return;
           }
