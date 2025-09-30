@@ -639,10 +639,10 @@ function findLambdaInvocationTargets(entries) {
       }
     }
 
-    const functionNameRegex = /FunctionName\s*[:=]\s*['"`]([^'"`]+)['"`]/gi;
+    const functionNameRegex = /FunctionName\s*[:=]\s*(["'])(.*?)\1|FunctionName\s*[:=]\s*`([\s\S]*?)`/gi;
     let fnMatch;
     while ((fnMatch = functionNameRegex.exec(content)) !== null) {
-      const name = fnMatch[1];
+      const name = fnMatch[0].slice('FunctionName: `'.length, -1);
       const key = `name|${name}`;
       if (!targets.has(key)) {
         targets.set(key, { type: 'name', value: name });
