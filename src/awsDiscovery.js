@@ -1,6 +1,10 @@
-import { LambdaClient, ListFunctionsCommand, ListEventSourceMappingsCommand } from '@aws-sdk/client-lambda';
+import fs from 'node:fs';
+import { LambdaClient, ListFunctionsCommand, ListEventSourceMappingsCommand, GetFunctionCommand } from '@aws-sdk/client-lambda';
 import { STSClient, GetCallerIdentityCommand } from '@aws-sdk/client-sts';
 import { fromNodeProviderChain } from '@aws-sdk/credential-providers';
+import AdmZip from 'adm-zip';
+import https from 'node:https';
+import { URL } from 'node:url';
 import { serviceColors } from './serviceColors.js';
 
 const serviceNameMap = {
@@ -27,6 +31,111 @@ const serviceNameMap = {
   ssmmessages: 'SSM',
   servicediscovery: 'CloudMap',
   kinesis: 'Kinesis'
+};
+
+const TEXT_FILE_EXTENSIONS = new Set([
+  'js',
+  'mjs',
+  'cjs',
+  'ts',
+  'tsx',
+  'json',
+  'py',
+  'java',
+  'cs',
+  'go',
+  'rb',
+  'php',
+  'sh',
+  'bash',
+  'yml',
+  'yaml',
+  'txt',
+  'md',
+  'env'
+]);
+
+const MAX_ARCHIVE_SIZE_BYTES = 20 * 1024 * 1024; // 20 MB safety cap
+const MAX_ENTRY_SIZE_BYTES = 10 * 1024 * 1024; // process text files up to 10 MB
+const MAX_TOTAL_TEXT_BYTES = 40 * 1024 * 1024; // aggregate cap for text parsing
+
+const SERVICE_HINT_PATTERNS = {
+  SQS: {
+    regexes: [
+      { pattern: /https?:\/\/sqs\.[a-z0-9-]+\.amazonaws\.com\/[0-9]{12}\/[A-Za-z0-9_.-]+/gi, resource: 'sqsQueueUrl' },
+      { pattern: /QueueUrl\s*[:=]\s*['"](https?:\/\/sqs\.[^'"`]+)['"]/gi, resource: 'sqsQueueUrl' },
+      { pattern: /\bSQSClient\b/g, resource: null },
+      { pattern: /\bAWS\.SQS\b/g, resource: null },
+      { pattern: /boto3\.client\(\s*['"]sqs['"]\s*\)/gi, resource: null },
+      { pattern: /\bsqs\.sendMessage(Command)?\b/gi, resource: null },
+      { pattern: /\bsqs\.send_message\b/gi, resource: null }
+    ]
+  },
+  SNS: {
+    regexes: [
+      { pattern: /\barn:aws[a-zA-Z-]*:sns:[^\s'"`]+/gi, resource: 'arn' },
+      { pattern: /\bSNSClient\b/g, resource: null },
+      { pattern: /\bAWS\.SNS\b/g, resource: null },
+      { pattern: /boto3\.client\(\s*['"]sns['"]\s*\)/gi, resource: null },
+      { pattern: /\bsns\.publish\b/gi, resource: null }
+    ]
+  },
+  S3: {
+    regexes: [
+      { pattern: /\bS3Client\b/g, resource: null },
+      { pattern: /\bAWS\.S3\b/g, resource: null },
+      { pattern: /boto3\.client\(\s*['"]s3['"]\s*\)/gi, resource: null },
+      { pattern: /\bs3\.putObject\b/gi, resource: null },
+      { pattern: /\bs3\.upload\b/gi, resource: null },
+      { pattern: /\bPutObjectCommand\b/g, resource: null }
+    ]
+  },
+  DynamoDB: {
+    regexes: [
+      { pattern: /\bDynamoDBClient\b/g, resource: null },
+      { pattern: /\bDocumentClient\b/g, resource: null },
+      { pattern: /boto3\.client\(\s*['"]dynamodb['"]\s*\)/gi, resource: null },
+      { pattern: /boto3\.resource\(\s*['"]dynamodb['"]\s*\)/gi, resource: null },
+      { pattern: /\bdynamodb\.put_item\b/gi, resource: null },
+      { pattern: /\bdynamodb\.updateItem\b/gi, resource: null }
+    ]
+  },
+  EventBridge: {
+    regexes: [
+      { pattern: /\bEventBridgeClient\b/g, resource: null },
+      { pattern: /\bEventBridge\b/g, resource: null },
+      { pattern: /\bPutEventsCommand\b/g, resource: null },
+      { pattern: /boto3\.client\(\s*['"]events['"]\s*\)/gi, resource: null }
+    ]
+  },
+  StepFunctions: {
+    regexes: [
+      { pattern: /\bSFNClient\b/g, resource: null },
+      { pattern: /\bStepFunctionsClient\b/g, resource: null },
+      { pattern: /boto3\.client\(\s*['"]stepfunctions['"]\s*\)/gi, resource: null },
+      { pattern: /\bstartExecution\b/gi, resource: null }
+    ]
+  },
+  Kinesis: {
+    regexes: [
+      { pattern: /\bKinesisClient\b/g, resource: null },
+      { pattern: /boto3\.client\(\s*['"]kinesis['"]\s*\)/gi, resource: null },
+      { pattern: /\bputRecords?\b/gi, resource: null }
+    ]
+  },
+  SecretsManager: {
+    regexes: [
+      { pattern: /\bSecretsManagerClient\b/g, resource: null },
+      { pattern: /boto3\.client\(\s*['"]secretsmanager['"]\s*\)/gi, resource: null }
+    ]
+  },
+  SSM: {
+    regexes: [
+      { pattern: /\bSSMClient\b/g, resource: null },
+      { pattern: /boto3\.client\(\s*['"]ssm['"]\s*\)/gi, resource: null },
+      { pattern: /\bget_parameter\b/gi, resource: null }
+    ]
+  }
 };
 
 class GraphBuilder {
@@ -361,6 +470,435 @@ function addDestinationRelations(builder, functionNodeId, functionResponseTypes 
   });
 }
 
+function normalizeFunctionArn(arn) {
+  if (typeof arn !== 'string') {
+    return null;
+  }
+  const trimmed = arn.trim();
+  const parts = trimmed.split(':');
+  if (parts.length > 7 && parts[5] === 'function') {
+    return parts.slice(0, 7).join(':');
+  }
+  return trimmed;
+}
+
+async function downloadLambdaCodeArchive(lambdaClient, functionIdentifier) {
+  const response = await lambdaClient.send(new GetFunctionCommand({ FunctionName: functionIdentifier }));
+  const location = response?.Code?.Location;
+  if (!location) {
+    return null;
+  }
+  const archiveBuffer = await downloadBufferFromUrl(location);
+  if (!archiveBuffer) {
+    return null;
+  }
+  if (archiveBuffer.length > MAX_ARCHIVE_SIZE_BYTES) {
+    throw new Error(`Code archive is too large (${Math.round(archiveBuffer.length / 1024)} KB)`);
+  }
+  return archiveBuffer;
+}
+
+async function downloadBufferFromUrl(url) {
+  if (typeof fetch === 'function') {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 20000);
+    try {
+      const response = await fetch(url, { signal: controller.signal });
+      if (!response.ok) {
+        throw new Error(`Download failed with status ${response.status}`);
+      }
+      const arrayBuffer = await response.arrayBuffer();
+      return Buffer.from(arrayBuffer);
+    } catch (error) {
+      throw new Error(`Download failed: ${error?.message || error}`);
+    } finally {
+      clearTimeout(timeoutId);
+    }
+  }
+
+  return new Promise((resolve, reject) => {
+    const parsed = new URL(url);
+    const request = https.get(parsed, (res) => {
+      if (!res || res.statusCode === undefined) {
+        reject(new Error('Invalid response when downloading code archive.'));
+        return;
+      }
+      if (res.statusCode >= 400) {
+        reject(new Error(`Download failed with status ${res.statusCode}`));
+        res.resume();
+        return;
+      }
+      const chunks = [];
+      res.on('data', (chunk) => {
+        chunks.push(chunk);
+      });
+      res.on('end', () => {
+        resolve(Buffer.concat(chunks));
+      });
+    });
+    request.on('error', (error) => {
+      reject(new Error(`Download failed: ${error?.message || error}`));
+    });
+    request.setTimeout(20000, () => {
+      request.destroy(new Error('Download timed out.'));
+    });
+  });
+}
+
+function containsBinaryData(buffer, sampleSize = 1024) {
+  const length = Math.min(buffer.length, sampleSize);
+  for (let index = 0; index < length; index += 1) {
+    const byte = buffer[index];
+    if (byte === 0) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function extractTextEntriesFromArchive(buffer) {
+  const zip = new AdmZip(buffer);
+  const entries = zip.getEntries();
+  const results = [];
+  let totalBytes = 0;
+
+  entries.forEach((entry) => {
+    if (entry.isDirectory) {
+      return;
+    }
+    if (entry.entryName.startsWith('__MACOSX/')) {
+      return;
+    }
+    const ext = entry.entryName.split('.').pop()?.toLowerCase() ?? '';
+    if (!TEXT_FILE_EXTENSIONS.has(ext)) {
+      return;
+    }
+
+    const data = entry.getData();
+    if (!data || data.length === 0) {
+      return;
+    }
+
+    if (data.length > MAX_ENTRY_SIZE_BYTES || containsBinaryData(data)) {
+      return;
+    }
+
+    totalBytes += data.length;
+    if (totalBytes > MAX_TOTAL_TEXT_BYTES) {
+      return;
+    }
+
+    try {
+      const content = data.toString('utf8');
+      results.push({ path: entry.entryName, content });
+    } catch (error) {
+      // Ignore files that cannot be decoded as UTF-8
+    }
+  });
+
+  return results;
+}
+
+function findLambdaInvocationTargets(entries) {
+  const targets = new Map();
+
+  entries.forEach(({ content }) => {
+    if (typeof content !== 'string') {
+      return;
+    }
+
+    const arnRegex = /arn:aws[a-zA-Z-]*:lambda:[^\s'"`]+/g;
+    let arnMatch;
+    while ((arnMatch = arnRegex.exec(content)) !== null) {
+      const arn = arnMatch[0];
+      const key = `arn|${arn}`;
+      if (!targets.has(key)) {
+        targets.set(key, { type: 'arn', value: arn });
+      }
+    }
+
+    const functionNameRegex = /FunctionName\s*[:=]\s*['"`]([^'"`]+)['"`]/gi;
+    let fnMatch;
+    while ((fnMatch = functionNameRegex.exec(content)) !== null) {
+      const name = fnMatch[1];
+      const key = `name|${name}`;
+      if (!targets.has(key)) {
+        targets.set(key, { type: 'name', value: name });
+      }
+    }
+
+    const invokeRegex = /\.invoke\s*\(\s*['"`]([^'"`]+)['"`]/gi;
+    let invokeMatch;
+    while ((invokeMatch = invokeRegex.exec(content)) !== null) {
+      const name = invokeMatch[1];
+      const key = `name|${name}`;
+      if (!targets.has(key)) {
+        targets.set(key, { type: 'name', value: name });
+      }
+    }
+  });
+
+  return Array.from(targets.values());
+}
+
+function resolveLambdaTarget(target, lambdaByArn, lambdaByName) {
+  if (!target || typeof target.value !== 'string') {
+    return null;
+  }
+
+  if (target.type === 'arn') {
+    const normalized = normalizeFunctionArn(target.value);
+    const known = lambdaByArn.get(target.value) || lambdaByArn.get(normalized ?? target.value);
+    if (known) {
+      const nodeId = known.FunctionArn || known.FunctionName;
+      return { nodeId, label: known.FunctionName || nodeId };
+    }
+    const label = normalized ? normalized.split(':').pop() : target.value;
+    return {
+      nodeId: normalized ?? target.value,
+      label: label || target.value
+    };
+  }
+
+  const rawName = target.value.trim();
+  if (!rawName) {
+    return null;
+  }
+
+  const baseName = rawName.split(':')[0];
+  const known = lambdaByName.get(rawName) || lambdaByName.get(baseName);
+  if (known) {
+    const nodeId = known.FunctionArn || known.FunctionName;
+    return { nodeId, label: known.FunctionName || nodeId };
+  }
+
+  return {
+    nodeId: `lambda://${baseName}`,
+    label: baseName
+  };
+}
+
+function sqsUrlToArn(url) {
+  const match = /^https?:\/\/sqs\.([a-z0-9-]+)\.amazonaws\.com\/([0-9]{12})\/([A-Za-z0-9_.-]+)/i.exec(url);
+  if (!match) {
+    return null;
+  }
+  const [, region, accountId, queueName] = match;
+  return `arn:aws:sqs:${region}:${accountId}:${queueName}`;
+}
+
+function findServiceUsageHints(entries) {
+  const hints = new Map();
+
+  entries.forEach(({ content }) => {
+    fs.writeFileSync('./tmp/' + Math.random().toString(36).substring(2, 15) + '.txt', content);
+    if (typeof content !== 'string' || content.length === 0) {
+      return;
+    }
+
+    Object.entries(SERVICE_HINT_PATTERNS).forEach(([service, config]) => {
+      config.regexes.forEach(({ pattern, resource }) => {
+        pattern.lastIndex = 0;
+        let match;
+        while ((match = pattern.exec(content)) !== null) {
+          const matchedValue = match[1] ?? match[0];
+          let resourceInfo = null;
+          if (resource === 'arn') {
+            resourceInfo = { type: 'arn', value: matchedValue };
+          } else if (resource === 'sqsQueueUrl') {
+            resourceInfo = { type: 'sqsQueueUrl', value: matchedValue };
+          }
+
+          const keyParts = [service];
+          if (resourceInfo) {
+            keyParts.push(resourceInfo.type, resourceInfo.value);
+          }
+          const key = keyParts.join('|');
+          if (!hints.has(key)) {
+            hints.set(key, { service, resource: resourceInfo });
+          }
+        }
+      });
+    });
+  });
+
+  return Array.from(hints.values());
+}
+
+function resolveServiceUsageHint(hint) {
+  if (!hint || !hint.service) {
+    return null;
+  }
+
+  if (hint.resource?.type === 'arn') {
+    const node = describeArn(hint.resource.value);
+    return {
+      node,
+      type: 'resource'
+    };
+  }
+
+  if (hint.resource?.type === 'sqsQueueUrl') {
+    const arn = sqsUrlToArn(hint.resource.value);
+    if (arn) {
+      const node = describeArn(arn);
+      return {
+        node,
+        type: 'resource'
+      };
+    }
+    const queueUrl = hint.resource.value;
+    const queueName = queueUrl.split('/').pop() || queueUrl;
+    const nodeId = `sqs-queue://${encodeURIComponent(queueUrl)}`;
+    return {
+      node: {
+        id: nodeId,
+        label: queueName,
+        service: 'SQS'
+      },
+      type: 'resource'
+    };
+  }
+
+  return {
+    node: {
+      id: `service://${hint.service}`,
+      label: hint.service,
+      service: hint.service
+    },
+    type: 'service'
+  };
+}
+
+async function discoverLambdaInvocationRelations(lambdaClient, builder, lambdaFunctions, warnings) {
+  if (!Array.isArray(lambdaFunctions) || lambdaFunctions.length === 0) {
+    return { attempted: 0, scanned: 0, failures: 0, addedEdges: 0 };
+  }
+
+  const lambdaByArn = new Map();
+  const lambdaByName = new Map();
+
+  lambdaFunctions.forEach((fn) => {
+    if (!fn) {
+      return;
+    }
+    if (fn.FunctionArn) {
+      lambdaByArn.set(fn.FunctionArn, fn);
+      const normalized = normalizeFunctionArn(fn.FunctionArn);
+      if (normalized) {
+        lambdaByArn.set(normalized, fn);
+      }
+    }
+    if (fn.FunctionName) {
+      lambdaByName.set(fn.FunctionName, fn);
+    }
+  });
+
+  let scanned = 0;
+  let failures = 0;
+  let addedInvocationEdges = 0;
+  let addedServiceEdges = 0;
+  const attempted = lambdaFunctions.length;
+
+  for (const fn of lambdaFunctions) {
+    if (!fn) {
+      // eslint-disable-next-line no-continue
+      continue;
+    }
+
+    const functionIdentifier = fn.FunctionArn || fn.FunctionName;
+    if (!functionIdentifier) {
+      // eslint-disable-next-line no-continue
+      continue;
+    }
+
+    let archiveBuffer;
+    try {
+      // eslint-disable-next-line no-await-in-loop
+      archiveBuffer = await downloadLambdaCodeArchive(lambdaClient, functionIdentifier);
+      if (!archiveBuffer) {
+        // eslint-disable-next-line no-continue
+        continue;
+      }
+    } catch (error) {
+      failures += 1;
+      warnings.push(`Failed to download code for ${fn.FunctionName || functionIdentifier}: ${error?.message || error}`);
+      // eslint-disable-next-line no-continue
+      continue;
+    }
+
+    scanned += 1;
+    let entries;
+    try {
+      entries = extractTextEntriesFromArchive(archiveBuffer);
+    } catch (error) {
+      failures += 1;
+      warnings.push(`Failed to inspect archive for ${fn.FunctionName || functionIdentifier}: ${error?.message || error}`);
+      // eslint-disable-next-line no-continue
+      continue;
+    }
+
+    if (!entries || entries.length === 0) {
+      // eslint-disable-next-line no-continue
+      continue;
+    }
+
+    const targets = findLambdaInvocationTargets(entries);
+    if (!targets.length) {
+      // eslint-disable-next-line no-continue
+      continue;
+    }
+
+    targets.forEach((target) => {
+      const resolved = resolveLambdaTarget(target, lambdaByArn, lambdaByName);
+      if (!resolved) {
+        return;
+      }
+
+      const sourceId = fn.FunctionArn || fn.FunctionName;
+      if (resolved.nodeId === sourceId) {
+        return;
+      }
+
+      builder.addNode({ id: resolved.nodeId, label: resolved.label, service: 'Lambda' });
+      const before = builder.edges.length;
+      builder.addEdge({ source: sourceId, target: resolved.nodeId, type: 'invokes' });
+      if (builder.edges.length > before) {
+        addedInvocationEdges += 1;
+      }
+    });
+
+    const serviceHints = findServiceUsageHints(entries);
+    serviceHints.forEach((hint) => {
+      const resolved = resolveServiceUsageHint(hint);
+      if (!resolved || !resolved.node) {
+        return;
+      }
+
+      const targetNode = builder.addNode({
+        id: resolved.node.id,
+        label: resolved.node.label,
+        service: resolved.node.service
+      });
+
+      const sourceId = fn.FunctionArn || fn.FunctionName;
+      const before = builder.edges.length;
+      builder.addEdge({ source: sourceId, target: targetNode.id, type: 'usesService' });
+      if (builder.edges.length > before) {
+        addedServiceEdges += 1;
+      }
+    });
+  }
+
+  return {
+    attempted,
+    scanned,
+    failures,
+    invocationEdges: addedInvocationEdges,
+    serviceEdges: addedServiceEdges
+  };
+}
+
 export async function buildAwsGraph() {
   const validationSteps = [];
   const warnings = [];
@@ -440,7 +978,7 @@ export async function buildAwsGraph() {
       const mappings = await listAllEventSourceMappings(lambdaClient, functionNodeId);
       addEventSourceRelations(builder, functionNodeId, mappings);
     } catch (error) {
-      warnings.push(`Failed to list event source mappings for ${fn.FunctionName}: ${error.message}`);
+      warnings.push(`Failed to list event source mappings for ${fn.FunctionName}: ${error?.message || error}`);
     }
 
     addDeadLetterRelation(builder, functionNodeId, fn.DeadLetterConfig);
@@ -451,6 +989,25 @@ export async function buildAwsGraph() {
     addFilesystemRelations(builder, functionNodeId, fn.FileSystemConfigs);
     addKmsRelation(builder, functionNodeId, fn.KMSKeyArn);
     addDestinationRelations(builder, functionNodeId, fn.FunctionResponseTypes);
+  }
+
+  const invocationStats = await discoverLambdaInvocationRelations(lambdaClient, builder, lambdaFunctions, warnings);
+  if (invocationStats) {
+    const attemptCount = invocationStats.attempted ?? lambdaFunctions.length;
+    const status = attemptCount > 0 && invocationStats.failures === attemptCount ? 'failure' : 'success';
+    const messageParts = [`Analyzed ${invocationStats.scanned}/${attemptCount} Lambda code package(s)`];
+    messageParts.push(`found ${invocationStats.invocationEdges ?? 0} Lambda invocation link(s)`);
+    if (invocationStats.serviceEdges) {
+      messageParts.push(`found ${invocationStats.serviceEdges} service usage link(s)`);
+    }
+    if (invocationStats.failures) {
+      messageParts.push(`${invocationStats.failures} package(s) failed to analyze`);
+    }
+    validationSteps.push({
+      action: 'codeAnalysis',
+      status,
+      message: `${messageParts.join('; ')}.`
+    });
   }
 
   const graph = builder.toGraph();
