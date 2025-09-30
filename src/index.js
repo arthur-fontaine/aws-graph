@@ -726,7 +726,8 @@ function buildHtmlPage({
                 .slice(0, 15);
             }, [searchTerm, filteredGraph]);
 
-            function focusNode(nodeId) {
+            function focusNode(nodeId, options = {}) {
+              const { fitView: shouldFit = false } = options;
               if (!nodeId) {
                 return;
               }
@@ -738,17 +739,19 @@ function buildHtmlPage({
                 selected: node.id === nodeId
               })));
 
-              window.requestAnimationFrame(() => {
-                const instance = reactFlowInstanceRef.current;
-                if (!instance) {
-                  return;
-                }
-                const targetNode = instance.getNode(nodeId);
-                if (!targetNode) {
-                  return;
-                }
-                instance.fitView({ nodes: [{ id: nodeId }], padding: 0.25, duration: 800, minZoom: 0.08 });
-              });
+              if (shouldFit) {
+                window.requestAnimationFrame(() => {
+                  const instance = reactFlowInstanceRef.current;
+                  if (!instance) {
+                    return;
+                  }
+                  const targetNode = instance.getNode(nodeId);
+                  if (!targetNode) {
+                    return;
+                  }
+                  instance.fitView({ nodes: [{ id: nodeId }], padding: 0.25, duration: 800, minZoom: 0.08 });
+                });
+              }
             }
 
             function toggleService(service) {
@@ -762,7 +765,7 @@ function buildHtmlPage({
               if (event.key === 'Enter') {
                 event.preventDefault();
                 if (searchMatches.length > 0) {
-                  focusNode(searchMatches[0].id);
+                  focusNode(searchMatches[0].id, { fitView: true });
                 }
               }
             }
@@ -847,7 +850,7 @@ function buildHtmlPage({
                             'button',
                             {
                               type: 'button',
-                              onClick: () => focusNode(match.id),
+                              onClick: () => focusNode(match.id, { fitView: true }),
                               style: {
                                 width: '100%',
                                 textAlign: 'left',

@@ -1,4 +1,4 @@
-import { LambdaClient, ListFunctionsCommand, ListEventSourceMappingsCommand, GetFunctionCommand } from '@aws-sdk/client-lambda';
+import { LambdaClient, ListFunctionsCommand, ListEventSourceMappingsCommand, GetFunctionCommand, ListAliasesCommand } from '@aws-sdk/client-lambda';
 import { STSClient, GetCallerIdentityCommand } from '@aws-sdk/client-sts';
 import { fromNodeProviderChain } from '@aws-sdk/credential-providers';
 import AdmZip from 'adm-zip';
@@ -332,6 +332,21 @@ async function listAllEventSourceMappings(lambdaClient, functionArn) {
   return results;
 }
 
+async function listAllAliases(lambdaClient, functionArn) {
+  const aliases = [];
+  let marker;
+  do {
+    const command = new ListAliasesCommand({ FunctionName: functionArn, Marker: marker });
+    // eslint-disable-next-line no-await-in-loop
+    const response = await lambdaClient.send(command);
+    if (response.Aliases) {
+      aliases.push(...response.Aliases);
+    }
+    marker = response.NextMarker;
+  } while (marker);
+  return aliases;
+}
+
 function extractArnsFromEnv(env = {}) {
   const arns = new Set();
   const arnRegex = /arn:[A-Za-z0-9_\-:/.]+/g;
@@ -357,14 +372,22 @@ function extractArnsFromEnv(env = {}) {
   return Array.from(arns);
 }
 
-function addEventSourceRelations(builder, functionNodeId, mappings) {
+function addEventSourceRelations(builder, functionNodeId, mappings, qualifierArns) {
   mappings.forEach((mapping) => {
     if (!mapping.EventSourceArn) {
       return;
     }
     const node = describeArn(mapping.EventSourceArn);
     builder.addNode(node);
-    builder.addEdge({ source: functionNodeId, target: node.id, type: 'eventSource' });
+    let targetId = functionNodeId;
+    const mappingFunctionArn = mapping.FunctionArn;
+    if (mappingFunctionArn && mappingFunctionArn !== functionNodeId) {
+      const normalizedMapping = normalizeFunctionArn(mappingFunctionArn);
+      if (normalizedMapping === functionNodeId || (qualifierArns && qualifierArns.has(mappingFunctionArn))) {
+        targetId = functionNodeId;
+      }
+    }
+    builder.addEdge({ source: node.id, target: targetId, type: 'eventSource' });
   });
 }
 
@@ -964,13 +987,73 @@ export async function buildAwsGraph() {
     const functionNodeId = fn.FunctionArn || fn.FunctionName;
     builder.addNode({ id: functionNodeId, label: fn.FunctionName, service: 'Lambda' });
 
+    const mappingAccumulator = new Map();
+
+    function recordMappings(list = []) {
+      list.forEach((mapping) => {
+        if (!mapping) {
+          return;
+        }
+        const key = mapping.UUID || `${mapping.EventSourceArn || 'unknown'}|${mapping.FunctionArn || functionNodeId}`;
+        if (!mappingAccumulator.has(key)) {
+          mappingAccumulator.set(key, mapping);
+        }
+      });
+    }
+
+    const qualifierArns = new Set([functionNodeId]);
+    if (fn.Version && fn.Version !== '$LATEST') {
+      const versionArn = `${functionNodeId}:${fn.Version}`;
+      qualifierArns.add(versionArn);
+      try {
+        // eslint-disable-next-line no-await-in-loop
+        const publishedMappings = await listAllEventSourceMappings(lambdaClient, versionArn);
+        recordMappings(publishedMappings);
+      } catch (publishedError) {
+        warnings.push(`Failed to list event source mappings for version ${versionArn}: ${publishedError?.message || publishedError}`);
+      }
+    }
+
+    try {
+      // eslint-disable-next-line no-await-in-loop
+      const aliases = await listAllAliases(lambdaClient, functionNodeId);
+      for (const alias of aliases) {
+        const aliasArn = alias.AliasArn || `${functionNodeId}:${alias.Name}`;
+        qualifierArns.add(aliasArn);
+        if (alias.Name) {
+          qualifierArns.add(`${fn.FunctionName}:${alias.Name}`);
+        }
+        if (alias.FunctionVersion) {
+          qualifierArns.add(`${functionNodeId}:${alias.FunctionVersion}`);
+          try {
+            // eslint-disable-next-line no-await-in-loop
+            const versionMappings = await listAllEventSourceMappings(lambdaClient, `${functionNodeId}:${alias.FunctionVersion}`);
+            recordMappings(versionMappings);
+          } catch (versionError) {
+            warnings.push(`Failed to list event source mappings for version ${functionNodeId}:${alias.FunctionVersion}: ${versionError?.message || versionError}`);
+          }
+        }
+        try {
+          // eslint-disable-next-line no-await-in-loop
+          const aliasMappings = await listAllEventSourceMappings(lambdaClient, aliasArn);
+          recordMappings(aliasMappings);
+        } catch (aliasError) {
+          warnings.push(`Failed to list event source mappings for alias ${aliasArn}: ${aliasError?.message || aliasError}`);
+        }
+      };
+    } catch (error) {
+      warnings.push(`Failed to list aliases for ${fn.FunctionName}: ${error?.message || error}`);
+    }
+
     try {
       // eslint-disable-next-line no-await-in-loop
       const mappings = await listAllEventSourceMappings(lambdaClient, functionNodeId);
-      addEventSourceRelations(builder, functionNodeId, mappings);
+      recordMappings(mappings);
     } catch (error) {
       warnings.push(`Failed to list event source mappings for ${fn.FunctionName}: ${error?.message || error}`);
     }
+
+    addEventSourceRelations(builder, functionNodeId, Array.from(mappingAccumulator.values()), qualifierArns);
 
     addDeadLetterRelation(builder, functionNodeId, fn.DeadLetterConfig);
     addRoleRelation(builder, functionNodeId, fn.Role);
