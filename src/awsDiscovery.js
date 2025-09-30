@@ -1,4 +1,3 @@
-import fs from 'node:fs';
 import { LambdaClient, ListFunctionsCommand, ListEventSourceMappingsCommand, GetFunctionCommand } from '@aws-sdk/client-lambda';
 import { STSClient, GetCallerIdentityCommand } from '@aws-sdk/client-sts';
 import { fromNodeProviderChain } from '@aws-sdk/credential-providers';
@@ -691,7 +690,6 @@ function findServiceUsageHints(entries) {
   const hints = new Map();
 
   entries.forEach(({ content }) => {
-    fs.writeFileSync('./tmp/' + Math.random().toString(36).substring(2, 15) + '.txt', content);
     if (typeof content !== 'string' || content.length === 0) {
       return;
     }
@@ -760,14 +758,7 @@ function resolveServiceUsageHint(hint) {
     };
   }
 
-  return {
-    node: {
-      id: `service://${hint.service}`,
-      label: hint.service,
-      service: hint.service
-    },
-    type: 'service'
-  };
+  return null;
 }
 
 async function discoverLambdaInvocationRelations(lambdaClient, builder, lambdaFunctions, warnings) {
