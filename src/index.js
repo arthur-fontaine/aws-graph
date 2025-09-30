@@ -48,8 +48,7 @@ function buildHtmlPage({
   warnings,
   serviceColorsMap
 }) {
-  const graphJson = JSON.stringify(graph, null, 2);
-  const graphJsonEscaped = escapeHtml(graphJson);
+  const graphJsonEscaped = escapeHtml(JSON.stringify(graph, null, 2));
   const validationHtml = renderValidationList(validationSteps);
   const warningsHtml = renderWarnings(warnings);
   const errorHtml = error ? `<div id="error">${escapeHtml(error)}</div>` : '';
@@ -214,7 +213,7 @@ function buildHtmlPage({
           });
 
           const edges = layout.edges.map((edge, index) => ({
-            id: \`edge-\${index}\`,
+            id: 'edge-' + index,
             source: edge.source,
             target: edge.target,
             label: edge.type ? String(edge.type) : undefined,
@@ -257,10 +256,13 @@ function buildHtmlPage({
             Panel
           } = window.ReactFlow;
 
-          const { createElement, useMemo, useState, useEffect } = window.React;
+          const { createElement, useMemo, useState, useEffect, useRef } = window.React;
           const { createRoot } = window.ReactDOM;
 
           function GraphApp() {
+            const reactFlowInstanceRef = useRef(null);
+            const focusedNodeRef = useRef(null);
+
             const allServices = useMemo(() => {
               const serviceSet = new Set();
               graphData.nodes.forEach((node) => {
@@ -271,7 +273,7 @@ function buildHtmlPage({
 
             const initialVisibility = useMemo(() => {
               const defaults = {};
-              const disabledByDefault = new Set(['IAM', 'Layer']);
+              const disabledByDefault = new Set(['IAM', 'Layer', 'VPC']);
               allServices.forEach((service) => {
                 defaults[service] = disabledByDefault.has(service) ? false : true;
               });
@@ -279,6 +281,10 @@ function buildHtmlPage({
             }, [allServices]);
 
             const [visibleServices, setVisibleServices] = useState(initialVisibility);
+            const [nodes, setNodes, onNodesChange] = useNodesState([]);
+            const [edges, setEdges, onEdgesChange] = useEdgesState([]);
+            const [searchTerm, setSearchTerm] = useState('');
+            const [focusedNodeId, setFocusedNodeId] = useState(null);
 
             const filteredGraph = useMemo(() => {
               const enabledServices = new Set();
@@ -287,39 +293,221 @@ function buildHtmlPage({
                   enabledServices.add(service);
                 }
               });
-              const nodes = graphData.nodes.filter((node) => enabledServices.has(node.service || 'Unknown'));
-              const allowedIds = new Set(nodes.map((node) => node.id));
-              const edges = graphData.edges.filter((edge) => allowedIds.has(edge.source) && allowedIds.has(edge.target));
-              return { nodes, edges };
+
+              const visibleNodes = graphData.nodes.filter((node) => enabledServices.has(node.service || 'Unknown'));
+              const allowedIds = new Set(visibleNodes.map((node) => node.id));
+              const visibleEdges = graphData.edges.filter((edge) => allowedIds.has(edge.source) && allowedIds.has(edge.target));
+              return { nodes: visibleNodes, edges: visibleEdges };
             }, [allServices, visibleServices]);
 
-            const [nodes, setNodes, onNodesChange] = useNodesState([]);
-            const [edges, setEdges, onEdgesChange] = useEdgesState([]);
-
             useEffect(() => {
+              if (focusedNodeRef.current && !filteredGraph.nodes.some((node) => node.id === focusedNodeRef.current)) {
+                focusedNodeRef.current = null;
+                setFocusedNodeId(null);
+              }
+
               const layout = buildReactFlowGraph(filteredGraph);
-              setNodes(layout.nodes);
+              const selectedId = focusedNodeRef.current;
+              setNodes(layout.nodes.map((node) => ({
+                ...node,
+                selected: selectedId ? node.id === selectedId : false
+              })));
               setEdges(layout.edges);
             }, [filteredGraph, setNodes, setEdges]);
 
-            const graphInfo = useMemo(() => ({
-              nodes: filteredGraph.nodes.length,
-              edges: filteredGraph.edges.length
-            }), [filteredGraph]);
+            const searchMatches = useMemo(() => {
+              const term = searchTerm.trim().toLowerCase();
+              if (!term) {
+                return [];
+              }
+
+              return filteredGraph.nodes
+                .map((node) => ({
+                  id: node.id,
+                  label: node.label || node.id,
+                  service: node.service || 'Unknown'
+                }))
+                .filter((node) => {
+                  return node.label.toLowerCase().includes(term) || node.id.toLowerCase().includes(term);
+                })
+                .slice(0, 15);
+            }, [searchTerm, filteredGraph]);
+
+            function focusNode(nodeId) {
+              if (!nodeId) {
+                return;
+              }
+
+              focusedNodeRef.current = nodeId;
+              setFocusedNodeId(nodeId);
+              setNodes((existingNodes) => existingNodes.map((node) => ({
+                ...node,
+                selected: node.id === nodeId
+              })));
+
+              window.requestAnimationFrame(() => {
+                const instance = reactFlowInstanceRef.current;
+                if (!instance) {
+                  return;
+                }
+                const targetNode = instance.getNode(nodeId);
+                if (!targetNode) {
+                  return;
+                }
+                instance.fitView({ nodes: [{ id: nodeId }], padding: 0.25, duration: 800, minZoom: 0.08 });
+              });
+            }
 
             function toggleService(service) {
               setVisibleServices((prev) => ({
                 ...prev,
-                [service]: prev[service] === false
-                  ? true
-                  : false
+                [service]: prev[service] === false ? true : false
               }));
             }
 
-            const controlsContent = [
-              createElement('strong', { key: 'summary' }, \`Nodes: \${graphInfo.nodes} • Edges: \${graphInfo.edges}\`),
+            function handleSearchKeyDown(event) {
+              if (event.key === 'Enter') {
+                event.preventDefault();
+                if (searchMatches.length > 0) {
+                  focusNode(searchMatches[0].id);
+                }
+              }
+            }
+
+            const controlsContent = [];
+
+            controlsContent.push(
+              createElement(
+                'div',
+                {
+                  key: 'search-container',
+                  style: {
+                    display: 'flex',
+                    flexDirection: 'column',
+                    gap: '6px'
+                  }
+                },
+                createElement('label', { htmlFor: 'graph-search', style: { fontWeight: 600 } }, 'Search nodes'),
+                createElement(
+                  'div',
+                  {
+                    style: {
+                      display: 'flex',
+                      gap: '6px'
+                    }
+                  },
+                  createElement('input', {
+                    id: 'graph-search',
+                    type: 'search',
+                    value: searchTerm,
+                    placeholder: 'Search nodes (name or ARN)…',
+                    onChange: (event) => setSearchTerm(event.target.value),
+                    onKeyDown: handleSearchKeyDown,
+                    style: {
+                      flex: 1,
+                      padding: '6px 8px',
+                      borderRadius: 6,
+                      border: '1px solid #c8c8c8',
+                      fontSize: '13px'
+                    }
+                  }),
+                  searchTerm
+                    ? createElement('button', {
+                        type: 'button',
+                        onClick: () => setSearchTerm(''),
+                        style: {
+                          border: '1px solid #c8c8c8',
+                          borderRadius: 6,
+                          padding: '6px 10px',
+                          background: '#f2f2f2',
+                          cursor: 'pointer'
+                        }
+                      }, 'Clear')
+                    : null
+                ),
+                searchTerm && searchMatches.length === 0
+                  ? createElement('div', { style: { fontSize: '12px', color: '#9a0000' } }, 'No matching nodes.')
+                  : null,
+                searchMatches.length > 0
+                  ? createElement(
+                      'ul',
+                      {
+                        style: {
+                          listStyle: 'none',
+                          padding: 0,
+                          margin: 0,
+                          display: 'flex',
+                          flexDirection: 'column',
+                          gap: '4px'
+                        }
+                      },
+                      ...searchMatches.map((match) => {
+                        const isFocused = match.id === focusedNodeId;
+                        const color = normalizeColor(serviceColors[match.service] || serviceColors.Unknown || '#999999');
+                        return createElement(
+                          'li',
+                          { key: 'search-' + match.id },
+                          createElement(
+                            'button',
+                            {
+                              type: 'button',
+                              onClick: () => focusNode(match.id),
+                              style: {
+                                width: '100%',
+                                textAlign: 'left',
+                                borderRadius: 6,
+                                border: isFocused ? '2px solid #2e73b8' : '1px solid #d0d0d0',
+                                padding: '6px 8px',
+                                display: 'flex',
+                                flexDirection: 'column',
+                                gap: '2px',
+                                background: isFocused ? 'rgba(46,115,184,0.08)' : '#fff',
+                                cursor: 'pointer'
+                              }
+                            },
+                            createElement('span', { style: { fontSize: '13px', fontWeight: 600 } }, match.label),
+                            createElement(
+                              'span',
+                              {
+                                style: {
+                                  fontSize: '11px',
+                                  color: '#555',
+                                  display: 'inline-flex',
+                                  alignItems: 'center',
+                                  gap: '6px'
+                                }
+                              },
+                              createElement('span', {
+                                style: {
+                                  width: '10px',
+                                  height: '10px',
+                                  borderRadius: '50%',
+                                  background: color,
+                                  border: '1px solid rgba(0,0,0,0.2)'
+                                }
+                              }),
+                              match.service,
+                              ' • ',
+                              match.id
+                            )
+                          )
+                        );
+                      })
+                    )
+                  : null
+              )
+            );
+
+            controlsContent.push(
+              createElement(
+                'strong',
+                { key: 'summary' },
+                'Nodes: ' + filteredGraph.nodes.length + ' • Edges: ' + filteredGraph.edges.length
+              )
+            );
+            controlsContent.push(
               createElement('span', { key: 'hint', style: { fontSize: '12px', color: '#555' } }, 'Toggle services to show or hide them.')
-            ];
+            );
 
             allServices.forEach((service) => {
               const color = normalizeColor(serviceColors[service] || serviceColors.Unknown || '#999999');
@@ -327,7 +515,7 @@ function buildHtmlPage({
                 createElement(
                   'label',
                   {
-                    key: \`svc-\${service}\`,
+                    key: 'svc-' + service,
                     style: {
                       display: 'flex',
                       alignItems: 'center',
@@ -375,7 +563,7 @@ function buildHtmlPage({
               gap: '8px',
               maxHeight: '70vh',
               overflowY: 'auto',
-              minWidth: '220px'
+              minWidth: '250px'
             };
 
             const panelInReactFlow = Panel
@@ -401,7 +589,12 @@ function buildHtmlPage({
                   panOnScroll: true,
                   connectionMode: ConnectionMode.Loose,
                   fitView: true,
-                  fitViewOptions: { padding: 0.15 }
+                  fitViewOptions: { padding: 0.15 },
+                  minZoom: 0.05,
+                  maxZoom: 3,
+                  onInit: (instance) => {
+                    reactFlowInstanceRef.current = instance;
+                  }
                 },
                 createElement(Background, { gap: 24, color: '#e2e2e2' }),
                 createElement(Controls, null),
