@@ -12,80 +12,11 @@ function escapeHtml(value) {
     .replace(/'/g, '&#39;');
 }
 
-function escapeLabel(value) {
-  return String(value ?? '').replace(/"/g, '\\"');
-}
-
-function serviceToClassName(service) {
-  return String(service || 'Unknown').toLowerCase().replace(/[^a-z0-9]+/g, '_') || 'unknown';
-}
-
-function normalizeColor(color) {
-  if (!color) {
-    return '#999999';
-  }
-  if (color.startsWith('#') && (color.length === 7 || color.length === 4)) {
-    return color;
-  }
-  return `#${color}`;
-}
-
-function pickTextColor(hex) {
-  const cleanHex = normalizeColor(hex).replace('#', '');
-  const expanded = cleanHex.length === 3
-    ? cleanHex.split('').map((char) => char + char).join('')
-    : cleanHex;
-
-  const r = parseInt(expanded.slice(0, 2), 16) / 255;
-  const g = parseInt(expanded.slice(2, 4), 16) / 255;
-  const b = parseInt(expanded.slice(4, 6), 16) / 255;
-  const luminance = 0.2126 * r + 0.7152 * g + 0.0722 * b;
-  return luminance > 0.65 ? '#000000' : '#ffffff';
-}
-
-function buildMermaidDiagram(graph) {
-  if (!graph?.nodes?.length) {
-    return {
-      diagram: 'graph TD\n  empty["No data available"]',
-      services: new Set()
-    };
-  }
-
-  const lines = ['graph TD'];
-  const serviceSet = new Set();
-  const nodeIdMap = new Map();
-
-  graph.nodes.forEach((node, index) => {
-    const mermaidId = `n${index}`;
-    nodeIdMap.set(node.id, mermaidId);
-    const service = node.service || 'Unknown';
-    serviceSet.add(service);
-    const className = serviceToClassName(service);
-    const label = escapeLabel(node.label || node.id || `Node ${index}`);
-    lines.push(`  ${mermaidId}["${label}"]:::${className}`);
-  });
-
-  graph.edges.forEach((edge) => {
-    const sourceId = nodeIdMap.get(edge.source);
-    const targetId = nodeIdMap.get(edge.target);
-    if (!sourceId || !targetId) {
-      return;
-    }
-    const label = edge.type ? `|${escapeLabel(edge.type)}|` : '';
-    lines.push(`  ${sourceId} -->${label ? `${label} ` : ' '}${targetId}`);
-  });
-
-  const classDefs = Array.from(serviceSet).map((service) => {
-    const className = serviceToClassName(service);
-    const fill = serviceColors[service] || serviceColors.Unknown || '#999999';
-    const textColor = pickTextColor(fill);
-    return `classDef ${className} fill:${fill},stroke:#333,color:${textColor};`;
-  });
-
-  return {
-    diagram: [...lines, ...classDefs].join('\n'),
-    services: serviceSet
-  };
+function serializeForScript(value) {
+  return JSON.stringify(value, null, 2)
+    .replace(/</g, '\\u003c')
+    .replace(/>/g, '\\u003e')
+    .replace(/&/g, '\\u0026');
 }
 
 function renderValidationList(validationSteps = []) {
@@ -111,63 +42,282 @@ function renderWarnings(warnings = []) {
 }
 
 function buildHtmlPage({
-  mermaidDiagram,
   graph,
   validationSteps,
   error,
-  warnings
+  warnings,
+  serviceColorsMap
 }) {
-  const graphJson = escapeHtml(JSON.stringify(graph, null, 2));
+  const graphJson = JSON.stringify(graph, null, 2);
+  const graphJsonEscaped = escapeHtml(graphJson);
   const validationHtml = renderValidationList(validationSteps);
   const warningsHtml = renderWarnings(warnings);
   const errorHtml = error ? `<div id="error">${escapeHtml(error)}</div>` : '';
   const regionInfo = escapeHtml(resolveRegion());
+  const scriptGraph = serializeForScript(graph);
+  const scriptColors = serializeForScript(serviceColorsMap);
 
   return `<!DOCTYPE html>
 <html lang="en">
   <head>
     <meta charset="utf-8">
     <title>AWS Service Graph</title>
-    <script src="https://cdn.jsdelivr.net/npm/mermaid/dist/mermaid.min.js"></script>
-    <script>
-      mermaid.initialize({ startOnLoad: true, securityLevel: 'loose' });
-    </script>
+    <link rel="stylesheet" href="https://unpkg.com/reactflow@11.10.0/dist/style.css">
     <style>
-      body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; margin: 0; padding: 2rem; background: #f5f5f5; color: #222; }
-      h1 { margin-top: 0; }
-      #error { background: #ffefef; border: 1px solid #e78; padding: 1rem; margin-bottom: 1rem; font-weight: bold; color: #a00; }
-      #warnings { background: #fff8e6; border: 1px solid #f4c542; padding: 1rem; margin-bottom: 1rem; }
+      :root { color-scheme: light; }
+      * { box-sizing: border-box; }
+      html, body { height: 100%; margin: 0; }
+      body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #f5f5f5; color: #222; display: flex; flex-direction: column; min-height: 100vh; }
+      h1 { margin: 0 0 0.5rem 0; }
+      main { flex: 1; display: flex; flex-direction: column; gap: 1rem; padding: 1.75rem; }
+      #error { background: #ffefef; border: 1px solid #e78; padding: 1rem; font-weight: bold; color: #a00; }
+      #warnings { background: #fff8e6; border: 1px solid #f4c542; padding: 1rem; }
       #warnings ul { margin: 0; padding-left: 1.5rem; }
-      .validation { list-style: none; padding: 0; margin: 0 0 1rem 0; display: grid; gap: 0.25rem; }
+      .validation { list-style: none; padding: 0; margin: 0; display: grid; gap: 0.25rem; }
       .validation li { padding: 0.5rem 0.75rem; border-radius: 4px; background: #fff; border-left: 4px solid transparent; }
       .validation li.ok { border-color: #2e8540; }
       .validation li.fail { border-color: #c00; }
       .validation li.unknown { border-color: #999; }
-      .mermaid { background: #fff; border-radius: 8px; padding: 1rem; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
-      pre { background: #111; color: #f5f5f5; padding: 1rem; border-radius: 8px; overflow-x: auto; }
-      footer { margin-top: 2rem; font-size: 0.875rem; color: #555; }
+      section { background: rgba(255,255,255,0.92); border-radius: 8px; padding: 1rem 1.25rem; box-shadow: 0 1px 2px rgba(0,0,0,0.05); }
+      section header { display: flex; align-items: baseline; justify-content: space-between; gap: 0.5rem; margin-bottom: 0.5rem; }
+      section header h2 { margin: 0; font-size: 1.125rem; }
+      section#graph { flex: 1; display: flex; flex-direction: column; min-height: 0; }
+      #graph-root { flex: 1; min-height: 480px; border: 1px solid #d1d1d1; border-radius: 8px; overflow: hidden; background: #fff; }
+      section#json pre { background: #111; color: #f5f5f5; padding: 1rem; border-radius: 8px; margin: 0; overflow-x: auto; max-height: 240px; font-size: 0.85rem; }
+      footer { padding: 1rem 1.75rem; font-size: 0.85rem; color: #555; }
+      .meta { margin: 0.25rem 0 1rem 0; color: #555; }
     </style>
   </head>
   <body>
-    <h1>AWS Service Graph</h1>
-    <p>Region: ${regionInfo}</p>
-    ${errorHtml}
-    ${warningsHtml}
-    <section id="validation">
-      <h2>Validation</h2>
-      ${validationHtml}
-    </section>
-    <section id="graph">
-      <h2>Graph</h2>
-      <div class="mermaid">
-${mermaidDiagram}
-      </div>
-    </section>
-    <section id="json">
-      <h2>Graph JSON</h2>
-      <pre>${graphJson}</pre>
-    </section>
-    <footer>Service colors are hardcoded in the application.</footer>
+    <main>
+      <header>
+        <div>
+          <h1>AWS Service Graph</h1>
+          <p class="meta">Region: ${regionInfo}</p>
+        </div>
+      </header>
+      ${errorHtml}
+      ${warningsHtml}
+      <section id="validation">
+        <header><h2>Validation</h2></header>
+        ${validationHtml}
+      </section>
+      <section id="graph">
+        <header><h2>Graph</h2></header>
+        <div id="graph-root"></div>
+      </section>
+      <section id="json">
+        <header><h2>Graph JSON</h2></header>
+        <pre>${graphJsonEscaped}</pre>
+      </section>
+    </main>
+    <footer>Service colors are hardcoded in the application and applied client-side.</footer>
+    <script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
+    <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
+    <script src="https://cdn.jsdelivr.net/npm/d3@7/dist/d3.min.js"></script>
+    <script src="https://unpkg.com/reactflow@11.10.0/dist/umd/index.js" crossorigin></script>
+    <script>
+      (function () {
+        const graphData = ${scriptGraph};
+        const serviceColors = ${scriptColors};
+
+        function normalizeColor(color) {
+          if (!color) return '#999999';
+          if (color.startsWith('#') && (color.length === 7 || color.length === 4)) {
+            return color;
+          }
+          return '#' + color.replace(/^#/, '');
+        }
+
+        function pickTextColor(hex) {
+          const cleanHex = normalizeColor(hex).replace('#', '');
+          const expanded = cleanHex.length === 3
+            ? cleanHex.split('').map((char) => char + char).join('')
+            : cleanHex;
+          const r = parseInt(expanded.slice(0, 2), 16) / 255;
+          const g = parseInt(expanded.slice(2, 4), 16) / 255;
+          const b = parseInt(expanded.slice(4, 6), 16) / 255;
+          const luminance = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+          return luminance > 0.65 ? '#000000' : '#ffffff';
+        }
+
+        function computeLayout(graph) {
+          const width = window.innerWidth || 1280;
+          const height = window.innerHeight || 720;
+          const simulationNodes = graph.nodes.map((node) => ({
+            id: node.id,
+            label: node.label ?? node.id,
+            service: node.service ?? 'Unknown',
+            x: Math.random() * width,
+            y: Math.random() * height
+          }));
+          const simulationLinks = graph.edges.map((edge) => ({
+            source: edge.source,
+            target: edge.target
+          }));
+
+          if (simulationNodes.length === 0) {
+            return { nodes: [], edges: [] };
+          }
+
+          const forceSim = window.d3.forceSimulation(simulationNodes)
+            .force('link', window.d3.forceLink(simulationLinks).id((d) => d.id).distance(200).strength(0.2))
+            .force('charge', window.d3.forceManyBody().strength(-600))
+            .force('center', window.d3.forceCenter(width / 2, height / 2))
+            .force('collision', window.d3.forceCollide().radius(90))
+            .stop();
+
+          for (let i = 0; i < 300; i += 1) {
+            forceSim.tick();
+          }
+
+          const minX = Math.min(...simulationNodes.map((node) => node.x));
+          const minY = Math.min(...simulationNodes.map((node) => node.y));
+          const padding = 120;
+
+          const laidOutNodes = simulationNodes.map((node) => ({
+            id: node.id,
+            label: node.label,
+            service: node.service,
+            position: {
+              x: node.x - minX + padding,
+              y: node.y - minY + padding
+            }
+          }));
+
+          return { nodes: laidOutNodes, edges: graph.edges };
+        }
+
+        function buildReactFlowGraph(graph) {
+          const layout = computeLayout(graph);
+
+          const nodes = layout.nodes.map((node) => {
+            const color = normalizeColor(serviceColors[node.service] || serviceColors.Unknown || '#999999');
+            const textColor = pickTextColor(color);
+            return {
+              id: node.id,
+              data: { label: node.label, service: node.service },
+              position: node.position,
+              style: {
+                background: color,
+                color: textColor,
+                border: '1px solid #333',
+                borderRadius: 8,
+                padding: '10px 14px',
+                fontSize: '14px',
+                fontWeight: 500,
+                width: 200,
+                textAlign: 'center',
+                boxShadow: '0 1px 3px rgba(0,0,0,0.15)'
+              }
+            };
+          });
+
+          const edges = layout.edges.map((edge, index) => ({
+            id: \`edge-\${index}\`,
+            source: edge.source,
+            target: edge.target,
+            label: edge.type ? String(edge.type) : undefined,
+            type: 'smoothstep',
+            markerEnd: {
+              type: window.ReactFlow.MarkerType.ArrowClosed,
+              width: 20,
+              height: 20,
+              color: '#444'
+            },
+            labelBgPadding: [4, 2],
+            labelBgBorderRadius: 4,
+            labelBgStyle: { fill: 'rgba(33, 33, 33, 0.8)', color: '#fff' },
+            animated: false
+          }));
+
+          return { nodes, edges };
+        }
+
+        function mountReactFlow() {
+          const rootElement = document.getElementById('graph-root');
+          if (!rootElement) {
+            return;
+          }
+
+          if (!window.React || !window.ReactDOM || !window.ReactFlow || !window.d3) {
+            rootElement.innerHTML = '<p style="padding:1rem;">Failed to load required visualization libraries.</p>';
+            return;
+          }
+
+          const {
+            ReactFlow: ReactFlowComponent,
+            ReactFlowProvider,
+            Background,
+            Controls,
+            MiniMap,
+            useNodesState,
+            useEdgesState,
+            ConnectionMode,
+            Panel
+          } = window.ReactFlow;
+
+          const { createElement, useMemo } = window.React;
+          const { createRoot } = window.ReactDOM;
+
+          function GraphApp() {
+            const initialGraph = useMemo(() => buildReactFlowGraph(graphData), []);
+            const [nodes, , onNodesChange] = useNodesState(initialGraph.nodes);
+            const [edges, , onEdgesChange] = useEdgesState(initialGraph.edges);
+
+            const graphInfo = useMemo(() => ({
+              nodes: graphData.nodes.length,
+              edges: graphData.edges.length
+            }), []);
+
+            return createElement(
+              'div',
+              { style: { width: '100%', height: '100%' } },
+              createElement(
+                ReactFlowComponent,
+                {
+                  nodes,
+                  edges,
+                  onNodesChange,
+                  onEdgesChange,
+                  nodesDraggable: true,
+                  nodesConnectable: false,
+                  panOnScroll: true,
+                  connectionMode: ConnectionMode.Loose,
+                  fitView: true,
+                  fitViewOptions: { padding: 0.15 }
+                },
+                createElement(Background, { gap: 24, color: '#e2e2e2' }),
+                createElement(Controls, null),
+                createElement(MiniMap, {
+                  nodeColor: (node) => node.style?.background || '#999999'
+                }),
+                Panel ? createElement(
+                  Panel,
+                  { position: 'top-left', style: { background: 'rgba(255,255,255,0.9)', padding: '6px 10px', borderRadius: 6, boxShadow: '0 1px 3px rgba(0,0,0,0.15)', fontSize: '13px' } },
+                  \`Nodes: \${graphInfo.nodes} • Edges: \${graphInfo.edges}\`
+                ) : null
+              )
+            );
+          }
+
+          const root = createRoot(rootElement);
+          root.render(
+            createElement(
+              ReactFlowProvider,
+              null,
+              createElement(GraphApp, null)
+            )
+          );
+        }
+
+        if (document.readyState === 'loading') {
+          document.addEventListener('DOMContentLoaded', mountReactFlow);
+        } else {
+          mountReactFlow();
+        }
+      })();
+    </script>
   </body>
 </html>`;
 }
@@ -185,11 +335,11 @@ async function handleRequest(req, res) {
   } catch (error) {
     const message = `Unexpected error while building graph: ${error?.message || 'Unknown error'}`;
     const body = buildHtmlPage({
-      mermaidDiagram: 'graph TD\n  failed["Unable to render graph"]',
       graph: { nodes: [], edges: [] },
       validationSteps: [{ action: 'runtime', status: 'failure', message }],
       error: message,
-      warnings: []
+      warnings: [],
+      serviceColorsMap: serviceColors
     });
     res.writeHead(500, { 'Content-Type': 'text/html' });
     res.end(body);
@@ -225,13 +375,12 @@ async function handleRequest(req, res) {
     return;
   }
 
-  const mermaid = buildMermaidDiagram(result.graph);
   const html = buildHtmlPage({
-    mermaidDiagram: mermaid.diagram,
     graph: result.graph,
     validationSteps,
     error: result.error,
-    warnings: result.warnings
+    warnings: result.warnings,
+    serviceColorsMap: serviceColors
   });
 
   res.writeHead(result.error ? 503 : 200, { 'Content-Type': 'text/html' });
