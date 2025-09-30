@@ -257,22 +257,137 @@ function buildHtmlPage({
             Panel
           } = window.ReactFlow;
 
-          const { createElement, useMemo } = window.React;
+          const { createElement, useMemo, useState, useEffect } = window.React;
           const { createRoot } = window.ReactDOM;
 
           function GraphApp() {
-            const initialGraph = useMemo(() => buildReactFlowGraph(graphData), []);
-            const [nodes, , onNodesChange] = useNodesState(initialGraph.nodes);
-            const [edges, , onEdgesChange] = useEdgesState(initialGraph.edges);
+            const allServices = useMemo(() => {
+              const serviceSet = new Set();
+              graphData.nodes.forEach((node) => {
+                serviceSet.add(node.service || 'Unknown');
+              });
+              return Array.from(serviceSet).sort((a, b) => a.localeCompare(b));
+            }, []);
+
+            const initialVisibility = useMemo(() => {
+              const defaults = {};
+              allServices.forEach((service) => {
+                defaults[service] = service === 'IAM' ? false : true;
+              });
+              return defaults;
+            }, [allServices]);
+
+            const [visibleServices, setVisibleServices] = useState(initialVisibility);
+
+            const filteredGraph = useMemo(() => {
+              const enabledServices = new Set();
+              allServices.forEach((service) => {
+                if (visibleServices[service] !== false) {
+                  enabledServices.add(service);
+                }
+              });
+              const nodes = graphData.nodes.filter((node) => enabledServices.has(node.service || 'Unknown'));
+              const allowedIds = new Set(nodes.map((node) => node.id));
+              const edges = graphData.edges.filter((edge) => allowedIds.has(edge.source) && allowedIds.has(edge.target));
+              return { nodes, edges };
+            }, [allServices, visibleServices]);
+
+            const [nodes, setNodes, onNodesChange] = useNodesState([]);
+            const [edges, setEdges, onEdgesChange] = useEdgesState([]);
+
+            useEffect(() => {
+              const layout = buildReactFlowGraph(filteredGraph);
+              setNodes(layout.nodes);
+              setEdges(layout.edges);
+            }, [filteredGraph, setNodes, setEdges]);
 
             const graphInfo = useMemo(() => ({
-              nodes: graphData.nodes.length,
-              edges: graphData.edges.length
-            }), []);
+              nodes: filteredGraph.nodes.length,
+              edges: filteredGraph.edges.length
+            }), [filteredGraph]);
+
+            function toggleService(service) {
+              setVisibleServices((prev) => ({
+                ...prev,
+                [service]: prev[service] === false
+                  ? true
+                  : false
+              }));
+            }
+
+            const controlsContent = [
+              createElement('strong', { key: 'summary' }, \`Nodes: \${graphInfo.nodes} • Edges: \${graphInfo.edges}\`),
+              createElement('span', { key: 'hint', style: { fontSize: '12px', color: '#555' } }, 'Toggle services to show or hide them.')
+            ];
+
+            allServices.forEach((service) => {
+              const color = normalizeColor(serviceColors[service] || serviceColors.Unknown || '#999999');
+              controlsContent.push(
+                createElement(
+                  'label',
+                  {
+                    key: \`svc-\${service}\`,
+                    style: {
+                      display: 'flex',
+                      alignItems: 'center',
+                      gap: '0.5rem',
+                      padding: '4px 0'
+                    }
+                  },
+                  createElement('input', {
+                    type: 'checkbox',
+                    checked: visibleServices[service] !== false,
+                    onChange: () => toggleService(service)
+                  }),
+                  createElement(
+                    'span',
+                    {
+                      style: {
+                        display: 'inline-flex',
+                        alignItems: 'center',
+                        gap: '0.35rem'
+                      }
+                    },
+                    createElement('span', {
+                      style: {
+                        width: '12px',
+                        height: '12px',
+                        borderRadius: '50%',
+                        background: color,
+                        border: '1px solid rgba(0,0,0,0.25)'
+                      }
+                    }),
+                    service
+                  )
+                )
+              );
+            });
+
+            const controlStyle = {
+              background: 'rgba(255,255,255,0.95)',
+              padding: '10px 12px',
+              borderRadius: 8,
+              boxShadow: '0 1px 4px rgba(0,0,0,0.2)',
+              fontSize: '13px',
+              display: 'flex',
+              flexDirection: 'column',
+              gap: '8px',
+              maxHeight: '70vh',
+              overflowY: 'auto',
+              minWidth: '220px'
+            };
+
+            const panelInReactFlow = Panel
+              ? createElement(Panel, { position: 'top-left', style: controlStyle }, ...controlsContent)
+              : null;
+
+            const fallbackPanel = Panel
+              ? null
+              : createElement('div', { style: { ...controlStyle, position: 'absolute', left: '16px', top: '16px' } }, ...controlsContent);
 
             return createElement(
               'div',
-              { style: { width: '100%', height: '100%' } },
+              { style: { width: '100%', height: '100%', position: 'relative' } },
               createElement(
                 ReactFlowComponent,
                 {
@@ -292,12 +407,9 @@ function buildHtmlPage({
                 createElement(MiniMap, {
                   nodeColor: (node) => node.style?.background || '#999999'
                 }),
-                Panel ? createElement(
-                  Panel,
-                  { position: 'top-left', style: { background: 'rgba(255,255,255,0.9)', padding: '6px 10px', borderRadius: 6, boxShadow: '0 1px 3px rgba(0,0,0,0.15)', fontSize: '13px' } },
-                  \`Nodes: \${graphInfo.nodes} • Edges: \${graphInfo.edges}\`
-                ) : null
-              )
+                panelInReactFlow
+              ),
+              fallbackPanel
             );
           }
 
