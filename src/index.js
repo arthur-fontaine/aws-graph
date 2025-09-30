@@ -140,6 +140,14 @@ function buildHtmlPage({
           return luminance > 0.65 ? '#000000' : '#ffffff';
         }
 
+        function buildEdgeKey(edge) {
+          if (!edge) {
+            return '';
+          }
+          const typeSegment = edge.type ? String(edge.type) : '';
+          return \`\${edge.source}|\${edge.target}|\${typeSegment}\`;
+        }
+
         function buildHeuristicLayout(nodes, edges) {
           // Fallback layered heuristic when dagre is unavailable.
           const nodesById = new Map();
@@ -469,23 +477,27 @@ function buildHtmlPage({
             };
           });
 
-          const edges = layout.edges.map((edge, index) => ({
-            id: 'edge-' + index,
-            source: edge.source,
-            target: edge.target,
-            label: edge.type ? String(edge.type) : undefined,
-            type: 'smoothstep',
-            markerEnd: {
-              type: window.ReactFlow.MarkerType.ArrowClosed,
-              width: 20,
-              height: 20,
-              color: '#444'
-            },
-            labelBgPadding: [4, 2],
-            labelBgBorderRadius: 4,
-            labelBgStyle: { fill: 'rgba(33, 33, 33, 0.8)', color: '#fff' },
-            animated: false
-          }));
+          const edges = layout.edges.map((edge) => {
+            const edgeId = buildEdgeKey(edge);
+            return {
+              id: edgeId,
+              source: edge.source,
+              target: edge.target,
+              label: edge.type ? String(edge.type) : undefined,
+              type: 'smoothstep',
+              markerEnd: {
+                type: window.ReactFlow.MarkerType.ArrowClosed,
+                width: 20,
+                height: 20,
+                color: '#444'
+              },
+              labelBgPadding: [4, 2],
+              labelBgBorderRadius: 4,
+              labelBgStyle: { fill: 'rgba(33, 33, 33, 0.8)', color: '#fff' },
+              style: { stroke: '#444', strokeWidth: 1.6, opacity: 0.75 },
+              animated: false
+            };
+          });
 
           return { nodes, edges };
         }
@@ -513,7 +525,7 @@ function buildHtmlPage({
             Panel
           } = window.ReactFlow;
 
-          const { createElement, useMemo, useState, useEffect, useRef } = window.React;
+          const { createElement, useMemo, useState, useEffect, useRef, useCallback } = window.React;
           const { createRoot } = window.ReactDOM;
 
           function GraphApp() {
@@ -557,20 +569,144 @@ function buildHtmlPage({
               return { nodes: visibleNodes, edges: visibleEdges };
             }, [allServices, visibleServices]);
 
+            const layout = useMemo(() => buildReactFlowGraph(filteredGraph), [filteredGraph]);
+
+            const highlightInfo = useMemo(() => {
+              if (!focusedNodeId) {
+                return null;
+              }
+
+              const focusExists = filteredGraph.nodes.some((node) => node.id === focusedNodeId);
+              if (!focusExists) {
+                return null;
+              }
+
+              const incoming = new Map();
+              const outgoing = new Map();
+              filteredGraph.nodes.forEach((node) => {
+                incoming.set(node.id, new Set());
+                outgoing.set(node.id, new Set());
+              });
+
+              filteredGraph.edges.forEach((edge) => {
+                if (!incoming.has(edge.target) || !incoming.has(edge.source)) {
+                  return;
+                }
+                incoming.get(edge.target).add(edge.source);
+                outgoing.get(edge.source).add(edge.target);
+              });
+
+              const relatedNodes = new Set([focusedNodeId]);
+
+              const upstreamQueue = [focusedNodeId];
+              while (upstreamQueue.length > 0) {
+                const current = upstreamQueue.shift();
+                const parents = incoming.get(current);
+                if (!parents) {
+                  continue;
+                }
+                parents.forEach((parentId) => {
+                  if (!relatedNodes.has(parentId)) {
+                    relatedNodes.add(parentId);
+                    upstreamQueue.push(parentId);
+                  }
+                });
+              }
+
+              const downstreamQueue = [focusedNodeId];
+              while (downstreamQueue.length > 0) {
+                const current = downstreamQueue.shift();
+                const children = outgoing.get(current);
+                if (!children) {
+                  continue;
+                }
+                children.forEach((childId) => {
+                  if (!relatedNodes.has(childId)) {
+                    relatedNodes.add(childId);
+                    downstreamQueue.push(childId);
+                  }
+                });
+              }
+
+              const relatedEdges = new Set();
+              filteredGraph.edges.forEach((edge) => {
+                if (relatedNodes.has(edge.source) && relatedNodes.has(edge.target)) {
+                  relatedEdges.add(buildEdgeKey(edge));
+                }
+              });
+
+              return { nodes: relatedNodes, edges: relatedEdges };
+            }, [filteredGraph, focusedNodeId]);
+
+            const clearFocus = useCallback(() => {
+              focusedNodeRef.current = null;
+              setFocusedNodeId(null);
+              setNodes((existingNodes) => existingNodes.map((node) => ({
+                ...node,
+                selected: false
+              })));
+            }, [setNodes]);
+
             useEffect(() => {
-              if (focusedNodeRef.current && !filteredGraph.nodes.some((node) => node.id === focusedNodeRef.current)) {
+              if (focusedNodeRef.current && !layout.nodes.some((node) => node.id === focusedNodeRef.current)) {
                 focusedNodeRef.current = null;
                 setFocusedNodeId(null);
               }
 
-              const layout = buildReactFlowGraph(filteredGraph);
               const selectedId = focusedNodeRef.current;
-              setNodes(layout.nodes.map((node) => ({
-                ...node,
-                selected: selectedId ? node.id === selectedId : false
-              })));
-              setEdges(layout.edges);
-            }, [filteredGraph, setNodes, setEdges]);
+              const highlightNodes = highlightInfo?.nodes;
+              const highlightEdges = highlightInfo?.edges;
+              const hasHighlight = Boolean(highlightNodes && highlightNodes.size);
+
+              setNodes(layout.nodes.map((node) => {
+                const baseStyle = node.style || {};
+                const isRelated = !hasHighlight || (highlightNodes ? highlightNodes.has(node.id) : false);
+                const updatedStyle = {
+                  ...baseStyle,
+                  transition: 'opacity 160ms ease-out, box-shadow 220ms ease-out'
+                };
+
+                if (hasHighlight) {
+                  updatedStyle.opacity = isRelated ? 1 : 0.08;
+                  updatedStyle.boxShadow = isRelated ? '0 12px 32px rgba(0,0,0,0.25)' : 'none';
+                } else {
+                  updatedStyle.opacity = baseStyle.opacity ?? 1;
+                }
+
+                return {
+                  ...node,
+                  selected: selectedId ? node.id === selectedId : false,
+                  style: updatedStyle
+                };
+              }));
+
+              setEdges(layout.edges.map((edge) => {
+                const baseStyle = edge.style || {};
+                const isRelated = !hasHighlight || (highlightEdges ? highlightEdges.has(edge.id) : false);
+                const updatedStyle = {
+                  ...baseStyle,
+                  transition: 'opacity 160ms ease-out, stroke-width 160ms ease-out'
+                };
+
+                if (hasHighlight) {
+                  updatedStyle.opacity = isRelated ? 0.95 : 0.12;
+                  updatedStyle.strokeWidth = isRelated ? 2.6 : 1.1;
+                } else {
+                  updatedStyle.opacity = baseStyle.opacity ?? 0.75;
+                  updatedStyle.strokeWidth = baseStyle.strokeWidth ?? 1.6;
+                }
+
+                const labelBgStyle = edge.labelBgStyle || {};
+                const labelStyle = edge.labelStyle || {};
+
+                return {
+                  ...edge,
+                  style: updatedStyle,
+                  labelBgStyle: hasHighlight ? { ...labelBgStyle, opacity: isRelated ? 1 : 0.12 } : labelBgStyle,
+                  labelStyle: hasHighlight ? { ...labelStyle, opacity: isRelated ? 1 : 0.12 } : labelStyle
+                };
+              }));
+            }, [layout, highlightInfo, setNodes, setEdges, setFocusedNodeId]);
 
             const searchMatches = useMemo(() => {
               const term = searchTerm.trim().toLowerCase();
@@ -671,7 +807,10 @@ function buildHtmlPage({
                   searchTerm
                     ? createElement('button', {
                         type: 'button',
-                        onClick: () => setSearchTerm(''),
+                        onClick: () => {
+                          setSearchTerm('');
+                          clearFocus();
+                        },
                         style: {
                           border: '1px solid #c8c8c8',
                           borderRadius: 6,
@@ -851,6 +990,14 @@ function buildHtmlPage({
                   maxZoom: 3,
                   onInit: (instance) => {
                     reactFlowInstanceRef.current = instance;
+                  },
+                  onNodeClick: (event, node) => {
+                    if (node?.id) {
+                      focusNode(node.id);
+                    }
+                  },
+                  onPaneClick: () => {
+                    clearFocus();
                   }
                 },
                 createElement(Background, { gap: 24, color: '#e2e2e2' }),
