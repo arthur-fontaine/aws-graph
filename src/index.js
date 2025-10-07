@@ -867,7 +867,8 @@ function buildHtmlPage({
                   style: {
                     display: 'flex',
                     flexDirection: 'column',
-                    gap: '6px'
+                    gap: '6px',
+                    maxWidth: '320px'
                   }
                 },
                 createElement('label', { htmlFor: 'graph-search', style: { fontWeight: 600 } }, 'Search nodes'),
@@ -969,7 +970,8 @@ function buildHtmlPage({
                                   height: '10px',
                                   borderRadius: '50%',
                                   background: color,
-                                  border: '1px solid rgba(0,0,0,0.2)'
+                                  border: '1px solid rgba(0,0,0,0.2)',
+                                  flexShrink: 0
                                 }
                               }),
                               match.service,
