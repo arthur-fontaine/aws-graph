@@ -642,7 +642,7 @@ function findLambdaInvocationTargets(entries) {
     const functionNameRegex = /FunctionName\s*[:=]\s*(["'])(.*?)\1|FunctionName\s*[:=]\s*`([\s\S]*?)`/gi;
     let fnMatch;
     while ((fnMatch = functionNameRegex.exec(content)) !== null) {
-      const name = fnMatch[0].slice('FunctionName: `'.length, -1);
+      const name = removeInterpolation(fnMatch[0].slice('FunctionName: `'.length, -1));
       const key = `name|${name}`;
       if (!targets.has(key)) {
         targets.set(key, { type: 'name', value: name });
@@ -652,7 +652,7 @@ function findLambdaInvocationTargets(entries) {
     const invokeRegex = /\.invoke\s*\(\s*['"`]([^'"`]+)['"`]/gi;
     let invokeMatch;
     while ((invokeMatch = invokeRegex.exec(content)) !== null) {
-      const name = invokeMatch[1];
+      const name = removeInterpolation(invokeMatch[1]);
       const key = `name|${name}`;
       if (!targets.has(key)) {
         targets.set(key, { type: 'name', value: name });
@@ -661,6 +661,10 @@ function findLambdaInvocationTargets(entries) {
   });
 
   return Array.from(targets.values());
+}
+
+function removeInterpolation(str) {
+  return str.replace(/\$\{\w+\}/g, '');
 }
 
 function resolveLambdaTarget(target, lambdaByArn, lambdaByName) {
