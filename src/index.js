@@ -1,5 +1,5 @@
 import http from 'node:http';
-import { buildAwsGraph, serviceColors, resolveRegion } from './awsDiscovery.js';
+import { buildAwsGraph, serviceColors, resolveRegion, searchCodeIndex, getCodeIndexStatus } from './awsDiscovery.js';
 
 const PORT = process.env.PORT || 3000;
 
@@ -46,7 +46,8 @@ function buildHtmlPage({
   validationSteps,
   error,
   warnings,
-  serviceColorsMap
+  serviceColorsMap,
+  codeSearchStatus
 }) {
   const graphJsonEscaped = escapeHtml(JSON.stringify(graph, null, 2));
   const validationHtml = renderValidationList(validationSteps);
@@ -55,6 +56,7 @@ function buildHtmlPage({
   const regionInfo = escapeHtml(resolveRegion());
   const scriptGraph = serializeForScript(graph);
   const scriptColors = serializeForScript(serviceColorsMap);
+  const scriptCodeSearchStatus = serializeForScript(codeSearchStatus || { ready: false, indexedFiles: 0, lastIndexedAt: null });
 
   return `<!DOCTYPE html>
 <html lang="en">
@@ -85,6 +87,18 @@ function buildHtmlPage({
       section#json pre { background: #111; color: #f5f5f5; padding: 1rem; border-radius: 8px; margin: 0; overflow-x: auto; max-height: 240px; font-size: 0.85rem; }
       footer { padding: 1rem 1.75rem; font-size: 0.85rem; color: #555; }
       .meta { margin: 0.25rem 0 1rem 0; color: #555; }
+      #code-search form { display: flex; gap: 0.5rem; flex-wrap: wrap; align-items: center; }
+      #code-search input[type="search"] { flex: 1; min-width: 240px; padding: 8px 10px; border-radius: 6px; border: 1px solid #c8c8c8; font-size: 14px; }
+      #code-search button { padding: 8px 12px; border-radius: 6px; border: 1px solid #2e73b8; background: #2e73b8; color: #fff; cursor: pointer; font-weight: 600; }
+      #code-search button:disabled { opacity: 0.6; cursor: not-allowed; }
+      #code-search-results { display: grid; gap: 0.75rem; }
+      .code-result { border: 1px solid #d8d8d8; border-radius: 8px; background: #fff; padding: 0.75rem; box-shadow: 0 1px 2px rgba(0,0,0,0.05); }
+      .code-result header { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center; margin-bottom: 0.5rem; }
+      .code-chip { display: inline-flex; align-items: center; gap: 0.4rem; background: #eef5ff; color: #12457a; padding: 4px 8px; border-radius: 999px; font-size: 12px; border: 1px solid #c9ddff; }
+      .code-context { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace; background: #0f172a; color: #e5e7eb; border-radius: 6px; padding: 8px; overflow-x: auto; }
+      .code-line { display: grid; grid-template-columns: auto 1fr; gap: 0.5rem; align-items: baseline; }
+      .line-number { color: #9ca3af; font-size: 12px; text-align: right; min-width: 36px; }
+      .code-line mark { background: #f59e0b; color: #111827; padding: 0 2px; border-radius: 3px; }
     </style>
   </head>
   <body>
@@ -100,6 +114,16 @@ function buildHtmlPage({
       <section id="validation">
         <header><h2>Validation</h2></header>
         ${validationHtml}
+      </section>
+      <section id="code-search">
+        <header><h2>Code Search</h2></header>
+        <p class="meta">Search downloaded Lambda source files (shows 2 lines of context around each hit).</p>
+        <form id="code-search-form">
+          <input id="code-search-input" type="search" placeholder="Search code (e.g. queue URL, env key, function call)..." />
+          <button type="submit">Search</button>
+        </form>
+        <div id="code-search-status" class="meta"></div>
+        <div id="code-search-results"></div>
       </section>
       <section id="graph">
         <header><h2>Graph</h2></header>
@@ -120,6 +144,20 @@ function buildHtmlPage({
         const graphData = ${scriptGraph};
         const serviceColors = ${scriptColors};
         const awsRegion = ${serializeForScript(resolveRegion())};
+        const initialCodeSearchStatus = ${scriptCodeSearchStatus};
+
+        function escapeHtmlClient(value) {
+          return String(value ?? '')
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;')
+            .replace(/'/g, '&#39;');
+        }
+
+        function escapeRegex(value) {
+          return value.replace(/[\\^$.*+?()[\]{}|]/g, '\\$&');
+        }
 
         function normalizeColor(color) {
           if (!color) return '#999999';
@@ -1116,10 +1154,154 @@ function buildHtmlPage({
           );
         }
 
-        if (document.readyState === 'loading') {
-          document.addEventListener('DOMContentLoaded', mountReactFlow);
-        } else {
+        async function requestCodeSearch(query) {
+          const response = await fetch('/code-search' + (query ? \`?q=\${encodeURIComponent(query)}\` : ''));
+          const payload = await response.json();
+          return { ok: response.ok, payload };
+        }
+
+        function renderCodeSearchStatus(status) {
+          const statusElement = document.getElementById('code-search-status');
+          if (!statusElement) {
+            return;
+          }
+          if (!status || !status.ready) {
+            statusElement.textContent = 'Code index is not built yet. Load the graph to trigger code scanning.';
+            return;
+          }
+          const indexed = typeof status.indexedFiles === 'number' ? status.indexedFiles : 0;
+          const when = status.lastIndexedAt ? new Date(status.lastIndexedAt).toLocaleString() : 'recently';
+          statusElement.textContent = \`Indexed \${indexed} file(s); last updated \${when}.\`;
+        }
+
+        function renderCodeSearchResults(payload, query) {
+          const resultsElement = document.getElementById('code-search-results');
+          if (!resultsElement) {
+            return;
+          }
+          resultsElement.innerHTML = '';
+
+          if (!payload || !payload.ready) {
+            resultsElement.innerHTML = '<p>Index not ready yet.</p>';
+            return;
+          }
+
+          const results = Array.isArray(payload.results) ? payload.results : [];
+          if (!results.length) {
+            resultsElement.innerHTML = '<p>No matches found.</p>';
+            return;
+          }
+
+          const highlightTerm = query ? new RegExp(escapeRegex(query), 'ig') : null;
+
+          const fragment = document.createDocumentFragment();
+          results.forEach((result) => {
+            const card = document.createElement('article');
+            card.className = 'code-result';
+
+            const header = document.createElement('header');
+            const fnChip = document.createElement('span');
+            fnChip.className = 'code-chip';
+            fnChip.textContent = result.functionName || result.functionId || 'Lambda';
+            const pathChip = document.createElement('span');
+            pathChip.className = 'code-chip';
+            pathChip.textContent = result.path || 'unknown';
+            const lineChip = document.createElement('span');
+            lineChip.className = 'code-chip';
+            lineChip.textContent = 'Line ' + (result.lineNumber || '?');
+
+            header.appendChild(fnChip);
+            header.appendChild(pathChip);
+            header.appendChild(lineChip);
+
+            const contextContainer = document.createElement('div');
+            contextContainer.className = 'code-context';
+
+            const contextLines = Array.isArray(result.context) ? result.context : [];
+            const startLine = Number.isFinite(result.contextStart) ? result.contextStart : 1;
+
+            contextLines.forEach((line, index) => {
+              const lineElement = document.createElement('div');
+              lineElement.className = 'code-line';
+
+              const lineNumber = document.createElement('span');
+              lineNumber.className = 'line-number';
+              lineNumber.textContent = startLine + index;
+
+              const code = document.createElement('code');
+              const safeLine = escapeHtmlClient(line ?? '');
+              if (highlightTerm) {
+                code.innerHTML = safeLine.replace(highlightTerm, (match) => '<mark>' + match + '</mark>');
+              } else {
+                code.innerHTML = safeLine;
+              }
+
+              lineElement.appendChild(lineNumber);
+              lineElement.appendChild(code);
+              contextContainer.appendChild(lineElement);
+            });
+
+            card.appendChild(header);
+            card.appendChild(contextContainer);
+            fragment.appendChild(card);
+          });
+
+          resultsElement.appendChild(fragment);
+        }
+
+        function setupCodeSearch() {
+          const form = document.getElementById('code-search-form');
+          const input = document.getElementById('code-search-input');
+          const submitButton = form?.querySelector('button');
+          if (!form || !input || !submitButton) {
+            return;
+          }
+
+          renderCodeSearchStatus(initialCodeSearchStatus);
+
+          form.addEventListener('submit', async (event) => {
+            event.preventDefault();
+            const query = input.value.trim();
+            if (!query) {
+              renderCodeSearchResults({ ready: true, results: [] }, '');
+              return;
+            }
+
+            submitButton.disabled = true;
+            submitButton.textContent = 'Searching...';
+            try {
+              const { ok, payload } = await requestCodeSearch(query);
+              if (!ok) {
+                renderCodeSearchResults({ ready: false, results: [] }, query);
+                renderCodeSearchStatus(payload);
+              } else {
+                renderCodeSearchStatus(payload);
+                renderCodeSearchResults(payload, query);
+              }
+            } catch (error) {
+              renderCodeSearchResults({ ready: false, results: [] }, query);
+              renderCodeSearchStatus({ ready: false });
+            } finally {
+              submitButton.disabled = false;
+              submitButton.textContent = 'Search';
+            }
+          });
+
+          // Refresh status asynchronously in case the index finishes after initial render.
+          requestCodeSearch('').then(({ payload }) => {
+            renderCodeSearchStatus(payload);
+          }).catch(() => {});
+        }
+
+        function init() {
           mountReactFlow();
+          setupCodeSearch();
+        }
+
+        if (document.readyState === 'loading') {
+          document.addEventListener('DOMContentLoaded', init);
+        } else {
+          init();
         }
       })();
     </script>
@@ -1134,6 +1316,23 @@ async function handleRequest(req, res) {
     return;
   }
 
+  let parsedUrl;
+  try {
+    parsedUrl = new URL(req.url, `http://localhost:${PORT}`);
+  } catch (error) {
+    parsedUrl = null;
+  }
+
+  if (parsedUrl && parsedUrl.pathname === '/code-search') {
+    const query = parsedUrl.searchParams.get('q') || '';
+    const limitParam = Number.parseInt(parsedUrl.searchParams.get('limit') || '', 10);
+    const result = searchCodeIndex(query, { limit: limitParam });
+    const statusCode = result.ready ? 200 : 503;
+    res.writeHead(statusCode, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(result, null, 2));
+    return;
+  }
+
   let result;
   try {
     result = await buildAwsGraph();
@@ -1144,7 +1343,8 @@ async function handleRequest(req, res) {
       validationSteps: [{ action: 'runtime', status: 'failure', message }],
       error: message,
       warnings: [],
-      serviceColorsMap: serviceColors
+      serviceColorsMap: serviceColors,
+      codeSearchStatus: getCodeIndexStatus()
     });
     res.writeHead(500, { 'Content-Type': 'text/html' });
     res.end(body);
@@ -1175,7 +1375,8 @@ async function handleRequest(req, res) {
       graph: result.graph,
       validationSteps,
       warnings: result.warnings,
-      error: result.error ?? null
+      error: result.error ?? null,
+      codeSearch: getCodeIndexStatus()
     }, null, 2));
     return;
   }
@@ -1185,7 +1386,8 @@ async function handleRequest(req, res) {
     validationSteps,
     error: result.error,
     warnings: result.warnings,
-    serviceColorsMap: serviceColors
+    serviceColorsMap: serviceColors,
+    codeSearchStatus: getCodeIndexStatus()
   });
 
   res.writeHead(result.error ? 503 : 200, { 'Content-Type': 'text/html' });

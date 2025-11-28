@@ -58,6 +58,97 @@ const MAX_ARCHIVE_SIZE_BYTES = 20 * 1024 * 1024; // 20 MB safety cap
 const MAX_ENTRY_SIZE_BYTES = 10 * 1024 * 1024; // process text files up to 10 MB
 const MAX_TOTAL_TEXT_BYTES = 40 * 1024 * 1024; // aggregate cap for text parsing
 
+const codeSearchIndex = [];
+let codeIndexMeta = { lastUpdated: null };
+const nodeModulesPattern = /(^|\/)node_modules(\/|$)/i;
+
+function resetCodeSearchIndex() {
+  codeSearchIndex.length = 0;
+  codeIndexMeta = { lastUpdated: null };
+}
+
+function addEntriesToCodeIndex(lambdaFunction, entries) {
+  if (!Array.isArray(entries) || entries.length === 0) {
+    return;
+  }
+
+  const functionId = lambdaFunction?.FunctionArn || lambdaFunction?.FunctionName || 'unknown';
+  const functionName = lambdaFunction?.FunctionName || functionId;
+
+  entries.forEach((entry) => {
+    if (!entry || typeof entry.content !== 'string') {
+      return;
+    }
+    if (entry.path && nodeModulesPattern.test(entry.path)) {
+      return;
+    }
+    codeSearchIndex.push({
+      functionId,
+      functionName,
+      path: entry.path || 'unknown',
+      lines: entry.content.split(/\r?\n/)
+    });
+  });
+  codeIndexMeta.lastUpdated = new Date().toISOString();
+}
+
+function searchCodeIndex(query, options = {}) {
+  const limit = Number.isFinite(options.limit) ? Math.max(1, Math.min(options.limit, 200)) : 50;
+  const normalized = (query || '').trim();
+  const results = [];
+
+  if (!normalized) {
+    return {
+      query: '',
+      ready: Boolean(codeIndexMeta.lastUpdated),
+      lastIndexedAt: codeIndexMeta.lastUpdated,
+      indexedFiles: codeSearchIndex.length,
+      results
+    };
+  }
+
+  const term = normalized.toLowerCase();
+
+  outer: for (const file of codeSearchIndex) {
+    const lines = Array.isArray(file.lines) ? file.lines : [];
+    for (let index = 0; index < lines.length; index += 1) {
+      const line = lines[index] ?? '';
+      if (!line.toLowerCase().includes(term)) {
+        continue;
+      }
+      const start = Math.max(0, index - 2);
+      const end = Math.min(lines.length, index + 3);
+      results.push({
+        functionId: file.functionId,
+        functionName: file.functionName,
+        path: file.path,
+        lineNumber: index + 1,
+        contextStart: start + 1,
+        context: lines.slice(start, end)
+      });
+      if (results.length >= limit) {
+        break outer;
+      }
+    }
+  }
+
+  return {
+    query: normalized,
+    ready: Boolean(codeIndexMeta.lastUpdated),
+    lastIndexedAt: codeIndexMeta.lastUpdated,
+    indexedFiles: codeSearchIndex.length,
+    results
+  };
+}
+
+function getCodeIndexStatus() {
+  return {
+    ready: Boolean(codeIndexMeta.lastUpdated),
+    lastIndexedAt: codeIndexMeta.lastUpdated,
+    indexedFiles: codeSearchIndex.length
+  };
+}
+
 const SERVICE_HINT_PATTERNS = {
   SQS: {
     regexes: [
@@ -861,6 +952,8 @@ async function discoverLambdaInvocationRelations(lambdaClient, builder, lambdaFu
       continue;
     }
 
+    addEntriesToCodeIndex(fn, entries);
+
     const targets = findLambdaInvocationTargets(entries);
     if (!targets.length) {
       // eslint-disable-next-line no-continue
@@ -920,6 +1013,8 @@ async function discoverLambdaInvocationRelations(lambdaClient, builder, lambdaFu
 export async function buildAwsGraph() {
   const validationSteps = [];
   const warnings = [];
+
+  resetCodeSearchIndex();
 
   const region = resolveRegion();
   const credentialCheck = await validateCredentials(region);
@@ -1097,6 +1192,10 @@ export async function buildAwsGraph() {
     message: `Discovered ${lambdaFunctions.length} Lambda function(s) and ${relatedCount} related resource(s).`
   });
 
+  if (!codeIndexMeta.lastUpdated) {
+    codeIndexMeta.lastUpdated = new Date().toISOString();
+  }
+
   return {
     graph,
     validationSteps,
@@ -1105,4 +1204,4 @@ export async function buildAwsGraph() {
   };
 }
 
-export { serviceColors, resolveRegion };
+export { serviceColors, resolveRegion, searchCodeIndex, getCodeIndexStatus };
